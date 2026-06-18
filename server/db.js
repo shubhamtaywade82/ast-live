@@ -299,6 +299,19 @@ export function jobStats() {
   };
 }
 
+export function skipPendingJobsForSymbols(symbols) {
+  const now = new Date().toISOString();
+  const stmt = db.prepare(`
+    UPDATE tune_jobs SET status = 'skipped', error = 'invalid symbol', finished_at = ?
+    WHERE symbol = ? AND status = 'pending'
+  `);
+  let total = 0;
+  for (const symbol of symbols) {
+    total += stmt.run(now, symbol).changes;
+  }
+  return total;
+}
+
 export function getKlineCache(symbol, interval, startMs, endMs) {
   const key = `${symbol}|${interval}|${startMs}|${endMs}`;
   const row = db.prepare("SELECT * FROM kline_cache WHERE cache_key = ?").get(key);

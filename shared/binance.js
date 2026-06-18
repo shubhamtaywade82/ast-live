@@ -1,7 +1,25 @@
 import { FAPI, BATCH } from "./constants.js";
 import { intervalMs } from "./market.js";
 
+const FAPI_SYMBOL_ALIASES = {
+  PEPEUSDT: "1000PEPEUSDT",
+  BONKUSDT: "1000BONKUSDT",
+  SHIBUSDT: "1000SHIBUSDT",
+  FLOKIUSDT: "1000FLOKIUSDT",
+  SATSUSDT: "1000SATSUSDT",
+};
+
+export function normalizeFapiSymbol(symbol) {
+  return FAPI_SYMBOL_ALIASES[symbol] ?? symbol;
+}
+
+export function isInvalidSymbolError(err) {
+  const msg = err?.message ?? String(err);
+  return msg.includes("-1121") || msg.includes("Invalid symbol");
+}
+
 export async function fetchKlines(symbol, interval, startMs, endMs, onProgress = null) {
+  const apiSymbol = normalizeFapiSymbol(symbol);
   const stepMs = intervalMs(interval);
   const all = [];
   let cursor = startMs;
@@ -9,7 +27,7 @@ export async function fetchKlines(symbol, interval, startMs, endMs, onProgress =
   const maxBatches = Math.ceil((endMs - startMs) / (stepMs * BATCH)) + 1;
 
   while (cursor < endMs) {
-    const url = `${FAPI}?symbol=${symbol}&interval=${interval}&startTime=${cursor}&endTime=${endMs}&limit=${BATCH}`;
+    const url = `${FAPI}?symbol=${apiSymbol}&interval=${interval}&startTime=${cursor}&endTime=${endMs}&limit=${BATCH}`;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`Binance ${res.status}: ${await res.text()}`);
     const data = await res.json();

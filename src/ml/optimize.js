@@ -61,7 +61,7 @@ function rescoreTopWithML(results, baseParams, attachMLFn, runBacktestFn, regime
   return filterProfitableResults(rescored).sort((a, b) => b.score - a.score);
 }
 
-export function runMLOptimization(candles, baseParams, ranges, runBacktestFn, options = {}) {
+export async function runMLOptimization(candles, baseParams, ranges, runBacktestFn, options = {}) {
   const { onProgress, regimeModel = null, compact = false, attachMLFn = null } = options;
 
   const baseBounds = options.bounds ?? buildParamBounds(ranges, compact);
@@ -108,7 +108,7 @@ export function runMLOptimization(candles, baseParams, ranges, runBacktestFn, op
     ? { populationSize: 20, generations: 8, eliteCount: 3, seedParams, regimeSeedRatio: 0.45, onProgress }
     : { populationSize: 32, generations: 12, eliteCount: 5, seedParams, regimeSeedRatio: 0.4, onProgress };
 
-  let results = geneticOptimize(candles, baseParams, bounds, evaluate, gaConfig);
+  let results = await geneticOptimize(candles, baseParams, bounds, evaluate, gaConfig);
 
   if (attachMLFn) {
     results = rescoreTopWithML(results, baseParams, attachMLFn, runBacktestFn, regime, 12);

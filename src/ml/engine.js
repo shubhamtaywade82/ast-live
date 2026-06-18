@@ -1,5 +1,7 @@
 // Client-side ML for adaptive Supertrend — no external deps, runs in browser.
 
+import { yieldToMain } from "../lib/yield.js";
+
 const REGIME_LABELS = ["Trending", "Mixed", "Choppy"];
 
 function clamp(v, lo, hi) {
@@ -344,7 +346,7 @@ export function filterProfitableResults(results) {
   });
 }
 
-export function geneticOptimize(candles, baseParams, bounds, evaluate, config = {}) {
+export async function geneticOptimize(candles, baseParams, bounds, evaluate, config = {}) {
   const {
     populationSize = 28,
     generations = 10,
@@ -391,6 +393,7 @@ export function geneticOptimize(candles, baseParams, bounds, evaluate, config = 
     population = nextPop;
 
     if (onProgress) onProgress(Math.round(((gen + 1) / generations) * 100));
+    await yieldToMain();
   }
 
   return filterProfitableResults(allResults).sort((a, b) => b.score - a.score);

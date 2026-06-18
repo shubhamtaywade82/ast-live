@@ -1,3 +1,4 @@
+import { isInvalidSymbolError } from "../../shared/binance.js";
 import {
   BACKGROUND_SYMBOLS,
   BACKGROUND_INTERVALS,
@@ -69,8 +70,13 @@ export async function startWorkerLoop() {
     try {
       await runTuneJob(job);
     } catch (e) {
-      console.error("Tune job failed:", job, e);
-      completeJob(job.id, null, e.message);
+      if (isInvalidSymbolError(e)) {
+        console.warn(`Skipping invalid FAPI symbol: ${job.symbol}`);
+        completeJob(job.id, null);
+      } else {
+        console.error("Tune job failed:", job, e);
+        completeJob(job.id, null, e.message);
+      }
     }
     currentJob = null;
     await sleep(150);

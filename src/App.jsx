@@ -16,7 +16,10 @@ import { runMLOptimization } from "./ml/optimize.js";
 import {
   BACKGROUND_SYMBOLS,
   BACKGROUND_INTERVALS,
+  SYMBOLS,
+  INTERVALS,
 } from "../shared/market.js";
+import { normalizeFapiSymbol } from "../shared/binance.js";
 import {
   loadPresets,
   savePreset,
@@ -28,6 +31,7 @@ import {
   getBackgroundStatus,
 } from "./storage/presetStore.js";
 import { fetchKlinesApi, isApiAvailable } from "./api/client.js";
+import { yieldToMain, isTabVisible } from "./lib/yield.js";
 
 function setBucketed(setter, value, step = 5) {
   const bucket = Math.min(100, Math.round(value / step) * step);
@@ -70,22 +74,6 @@ const FEE_RT = 0.0008;
 const SLIP_RT = 0.0004;
 const COST_RT = FEE_RT + SLIP_RT;
 
-const SYMBOLS = [
-  "SOLUSDT", "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT",
-  "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT",
-  "NEARUSDT", "ATOMUSDT", "INJUSDT", "SUIUSDT", "WIFUSDT",
-  "PEPEUSDT", "TIAUSDT", "SEIUSDT", "AAVEUSDT", "LTCUSDT",
-];
-
-const INTERVALS = [
-  { label: "1m", ms: 60e3 }, { label: "3m", ms: 3 * 60e3 }, { label: "5m", ms: 5 * 60e3 },
-  { label: "15m", ms: 15 * 60e3 }, { label: "30m", ms: 30 * 60e3 },
-  { label: "1h", ms: 3600e3 }, { label: "2h", ms: 2 * 3600e3 }, { label: "4h", ms: 4 * 3600e3 },
-  { label: "6h", ms: 6 * 3600e3 }, { label: "12h", ms: 12 * 3600e3 },
-  { label: "1d", ms: 86400e3 }, { label: "3d", ms: 3 * 86400e3 },
-  { label: "1w", ms: 7 * 86400e3 }, { label: "1M", ms: 30 * 86400e3 },
-];
-
 const PRESETS = [
   { label: "1D", days: 1 }, { label: "3D", days: 3 }, { label: "1W", days: 7 },
   { label: "2W", days: 14 }, { label: "1M", days: 30 }, { label: "3M", days: 90 },
@@ -102,6 +90,7 @@ const HTF_INTERVALS = [
 
 // ─── Binance FAPI Fetcher (paginated) ─────────────────────────────────────────
 async function fetchKlines(symbol, interval, startMs, endMs, onProgress) {
+  const apiSymbol = normalizeFapiSymbol(symbol);
   const intervalMs = INTERVALS.find(i => i.label === interval)?.ms ?? 3600e3;
   const all = [];
   let cursor = startMs;
@@ -109,7 +98,7 @@ async function fetchKlines(symbol, interval, startMs, endMs, onProgress) {
   const maxBatches = Math.ceil((endMs - startMs) / (intervalMs * BATCH)) + 1;
 
   while (cursor < endMs) {
-    const url = `${FAPI}?symbol=${symbol}&interval=${interval}&startTime=${cursor}&endTime=${endMs}&limit=${BATCH}`;
+    const url = `${FAPI}?symbol=${apiSymbol}&interval=${interval}&startTime=${cursor}&endTime=${endMs}&limit=${BATCH}`;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`Binance ${res.status}: ${await res.text()}`);
     const data = await res.json();
@@ -815,6 +804,10 @@ function runOptimization(candles, baseParams, ranges, onProgress, compact = fals
 }
 
 function runSmartOptimization(candles, baseParams, ranges, onProgress, options = {}) {
+  return runSmartOptimizationAsync(candles, baseParams, ranges, onProgress, options);
+}
+
+async function runSmartOptimizationAsync(candles, baseParams, ranges, onProgress, options = {}) {
   const {
     useML = true,
     regimeModel = null,
@@ -823,7 +816,7 @@ function runSmartOptimization(candles, baseParams, ranges, onProgress, options =
   } = options;
 
   if (useML) {
-    const ml = runMLOptimization(
+    const ml = await runMLOptimization(
       candles,
       baseParams,
       ranges,
@@ -978,11 +971,9 @@ async function tuneConfigurationJob(job, baseParams) {
 
   const config = getAdaptiveConfig(candles.length);
   const ranges = buildOptRanges(true);
-  const r = runAdaptiveBacktest(candles, tuneParams, ranges, config, htfAligned, null, { useML: true });
+  const r = await runAdaptiveBacktest(candles, tuneParams, ranges, config, htfAligned, null, { useML: true });
 
-  const searchEntries = runEquityPositiveParamSearch(candles, tuneParams, htfAligned, null);
-  const bestEntry = searchEntries[0];
-  const tunedParams = r.tunedParams ?? bestEntry?.params;
+  const tunedParams = r.tunedParams ?? r.profitableParamHistory?.at(-1)?.params;
   if (!tunedParams) return null;
 
   const equityStart = tuneParams.startEquity || 10000;
@@ -1001,11 +992,11 @@ async function tuneConfigurationJob(job, baseParams) {
     equityStart,
     equityEnd,
     equityGain: equityEnd - equityStart,
-    netReturn: parseFloat(r.stats?.netReturn ?? bestEntry?.netReturn ?? 0),
+    netReturn: parseFloat(r.stats?.netReturn ?? 0),
     sharpe: r.stats?.sharpe,
     maxDD: r.stats?.maxDD,
     totalTrades: r.stats?.totalTrades,
-    regime: r.currentRegime?.label ?? bestEntry?.regime ?? r.mlMeta?.regime?.label,
+    regime: r.currentRegime?.label ?? r.mlMeta?.regime?.label,
     regimeConfidence: r.currentRegime?.confidence ?? r.mlMeta?.regime?.confidence,
     barCount: candles.length,
     source: "background",
@@ -1062,10 +1053,10 @@ function resultsToEquityEntries(results, startEquity, source = "full-search") {
     }));
 }
 
-function runEquityPositiveParamSearch(candles, baseParams, htfAlignedDir, onProgress) {
-  const compact = candles.length > 2500;
+async function runEquityPositiveParamSearch(candles, baseParams, htfAlignedDir, onProgress) {
+  const compact = candles.length > 1200;
   const ranges = buildOptRanges(compact);
-  const { results } = runSmartOptimization(
+  const { results } = await runSmartOptimizationAsync(
     candles,
     baseParams,
     ranges,
@@ -1301,18 +1292,18 @@ function assembleBacktestResult(candles, p, indicators, trades, equityCurve, dra
   };
 }
 
-function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedDir = null, onProgress, options = {}) {
+async function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedDir = null, onProgress, options = {}) {
   const { useML = true } = options;
   const { lookback, retuneEvery } = config;
   const n = candles.length;
   const startEquity = baseParams.startEquity || 10000;
-  const compact = n > 2500;
+  const compact = n > 1200;
   let mlMeta = null;
   let lastWindowRegime = null;
 
   if (n < lookback + 50) {
     const causalModel = n >= 80 ? buildRegimeModel(candles) : null;
-    const { results, mlMeta: meta } = runSmartOptimization(
+    const { results, mlMeta: meta } = await runSmartOptimizationAsync(
       candles, baseParams, optRanges, onProgress,
       { useML, regimeModel: causalModel, compact, htfAlignedDir },
     );
@@ -1414,7 +1405,7 @@ function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedD
         holdoutHtf = trainHtf?.slice(split) ?? null;
       }
 
-      const { results, mlMeta: meta } = runSmartOptimization(
+      const { results, mlMeta: meta } = await runSmartOptimizationAsync(
         optCandles, baseParams, optRanges,
         p => { if (onProgress) onProgress(Math.round((step / totalSteps) * 50 + p * 0.5)); },
         {
@@ -1514,6 +1505,7 @@ function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedD
     cursor = segEnd;
     step++;
     if (onProgress) onProgress(Math.round((step / totalSteps) * 100));
+    await yieldToMain();
   }
 
   for (let i = 0; i < n; i++) {
@@ -2577,7 +2569,7 @@ export default function App() {
   const bgStopRef = useRef(false);
   const foregroundBusyRef = useRef(false);
 
-  const [backgroundScan, setBackgroundScan] = useState(true);
+  const [backgroundScan, setBackgroundScan] = useState(false);
   const [bgRunning, setBgRunning] = useState(false);
   const [bgProgress, setBgProgress] = useState(0);
   const [bgStatus, setBgStatus] = useState("");
@@ -2709,8 +2701,8 @@ export default function App() {
         }
 
         const config = getAdaptiveConfig(candles.length);
-        const ranges = buildOptRanges(candles.length > 2500);
-        const r = runAdaptiveBacktest(
+        const ranges = buildOptRanges(candles.length > 1200);
+        const r = await runAdaptiveBacktest(
           candles,
           paramsRef.current,
           ranges,
@@ -2722,16 +2714,7 @@ export default function App() {
         if (cancelled) return;
 
         const adaptiveEntries = (r.profitableParamHistory || []).filter(e => e.confirmed);
-        let mergedHistory = mergeEquityPositiveParams(profitableParamsRef.current, adaptiveEntries);
-
-        const searchEntries = runEquityPositiveParamSearch(
-          candles,
-          paramsRef.current,
-          htfAligned,
-          p => { if (!cancelled) setBucketed(setTuneProgress, Math.min(99, 50 + Math.round(p * 0.5))); },
-        );
-        if (cancelled) return;
-        mergedHistory = mergeEquityPositiveParams(mergedHistory, searchEntries);
+        const mergedHistory = mergeEquityPositiveParams(profitableParamsRef.current, adaptiveEntries);
         profitableParamsRef.current = mergedHistory;
 
         setResult(r);
@@ -2790,6 +2773,10 @@ export default function App() {
       await startBackgroundScan({ symbol, interval, htfMultiplier });
       let lastPresetCount = -1;
       while (!cancelled && backgroundScan && !bgStopRef.current) {
+        if (!isTabVisible()) {
+          await new Promise(r => setTimeout(r, 5000));
+          continue;
+        }
         const status = await getBackgroundStatus();
         if (status) {
           setIfChanged(setBgRunning, status.running);
@@ -2819,9 +2806,9 @@ export default function App() {
       setBgStatus(`Queued ${queue.length} configurations (client)`);
       await runBackgroundTuner({
         jobs: queue,
-        shouldStop: () => cancelled || bgStopRef.current || !backgroundScan,
+        shouldStop: () => cancelled || bgStopRef.current || !backgroundScan || !isTabVisible(),
         shouldPause: () => foregroundBusyRef.current,
-        delayMs: 150,
+        delayMs: 8000,
         runJob: job => tuneConfigurationJob(job, paramsRef.current),
         onJobStart: (job, done, total) => setBgStatus(`${job.symbol} ${job.interval} (${done + 1}/${total})`),
         onJobComplete: async (_job, preset) => {
@@ -2864,14 +2851,14 @@ export default function App() {
     setOptProgress(0);
     setError("");
 
-    const timer = setTimeout(() => {
+    const timer = setTimeout(async () => {
       try {
         let htfAligned = null;
         if (htfResult && htfMultiplier > 0) {
           htfAligned = alignHTFDir(candles, htfCandles, htfResult.dir);
         }
 
-        const entries = runEquityPositiveParamSearch(
+        const entries = await runEquityPositiveParamSearch(
           candles,
           paramsRef.current,
           htfAligned,
@@ -3039,27 +3026,26 @@ export default function App() {
     if (!candles.length) return;
     setOptRunning(true);
     setOptProgress(0);
-    setTimeout(() => {
-      try {
-        let htfAligned = null;
-        if (htfResult && htfMultiplier > 0) {
-          htfAligned = alignHTFDir(candles, htfCandles, htfResult.dir);
-        }
-        const entries = runEquityPositiveParamSearch(
-          candles,
-          params,
-          htfAligned,
-          p => setBucketed(setOptProgress, p),
-        );
-        const merged = mergeEquityPositiveParams(profitableParamsRef.current, entries);
-        profitableParamsRef.current = merged;
-        setProfitableParams(merged);
-        setOptResults(merged.length ? tuneHistoryToOptResults(merged) : null);
-      } catch (e) {
-        setError("Optimization failed: " + e.message);
+    try {
+      let htfAligned = null;
+      if (htfResult && htfMultiplier > 0) {
+        htfAligned = alignHTFDir(candles, htfCandles, htfResult.dir);
       }
+      const entries = await runEquityPositiveParamSearch(
+        candles,
+        params,
+        htfAligned,
+        p => setBucketed(setOptProgress, p),
+      );
+      const merged = mergeEquityPositiveParams(profitableParamsRef.current, entries);
+      profitableParamsRef.current = merged;
+      setProfitableParams(merged);
+      setOptResults(merged.length ? tuneHistoryToOptResults(merged) : null);
+    } catch (e) {
+      setError("Optimization failed: " + e.message);
+    } finally {
       setOptRunning(false);
-    }, 50);
+    }
   }, [candles, params, htfResult, htfMultiplier, htfCandles]);
 
   // ── Run Monte Carlo ──

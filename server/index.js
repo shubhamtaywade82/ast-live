@@ -4,6 +4,9 @@ import presetsRouter from "./routes/presets.js";
 import jobsRouter from "./routes/jobs.js";
 import klinesRouter from "./routes/klines.js";
 import { startWorkerLoop, seedFullQueue } from "./services/queue.js";
+import { skipPendingJobsForSymbols } from "./db.js";
+
+const LEGACY_INVALID_SYMBOLS = ["PEPEUSDT"];
 
 const app = express();
 const PORT = process.env.AST_API_PORT || 3210;
@@ -23,6 +26,8 @@ app.use("/api/klines", klinesRouter);
 app.listen(PORT, HOST, () => {
   console.log(`AST Live API http://${HOST}:${PORT}`);
   if (process.env.AST_AUTO_SEED !== "0") {
+    const skipped = skipPendingJobsForSymbols(LEGACY_INVALID_SYMBOLS);
+    if (skipped > 0) console.log(`Skipped ${skipped} pending jobs with invalid FAPI symbols`);
     const pending = seedFullQueue();
     console.log(`Seeded ${pending} tune jobs`);
     startWorkerLoop();
