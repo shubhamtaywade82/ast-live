@@ -7,12 +7,11 @@ import {
   extractMarketFeatures,
   predictLogistic,
   trainLogisticRegression,
+  roundParamValue,
+  normalizeParams,
+  fmtParamValue,
 } from "./ml/engine.js";
-import {
-  runMLOptimization,
-  isProfitableBacktest,
-  filterProfitableResults,
-} from "./ml/optimize.js";
+import { runMLOptimization } from "./ml/optimize.js";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ADAPTIVE SUPERTRIND PRO v2.1 — Continued Enhancements
@@ -644,9 +643,7 @@ function runWalkForward(candles, baseParams, optRanges, wfConfig) {
     const testCandles = candles.slice(cursor + trainSize, cursor + trainSize + testSize);
 
     // Optimize on training set (limited grid for speed)
-    const trainResults = runSmartOptimization(
-      trainCandles, baseParams, optRanges, null, { useML: true, compact: true },
-    ).results;
+    const trainResults = runOptimization(trainCandles, baseParams, optRanges);
     if (!trainResults.length) { cursor += testSize; continue; }
 
     const bestParams = { ...baseParams, ...trainResults[0].params };
@@ -748,52 +745,38 @@ function runMonteCarlo(trades, equityCurve, startEquity, iterations = 1000) {
 //  PARAMETER OPTIMIZATION
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function runOptimization(candles, baseParams, ranges, onProgress) {
+function runOptimization(candles, baseParams, ranges, onProgress, compact = false) {
   const results = [];
-  let total = 0, done = 0;
+  const combos = buildParamCombos(ranges, compact);
+  const total = combos.length;
 
-  const combos = [];
-  for (const atrP of ranges.atrPeriod) {
-    for (const erL of ranges.erLength) {
-      for (const smL of ranges.smoothLength) {
-        for (const minF of ranges.minFactor) {
-          for (const maxF of ranges.maxFactor) {
-            if (minF >= maxF) continue;
-            combos.push({ atrPeriod: atrP, erLength: erL, smoothLength: smL, minFactor: minF, maxFactor: maxF });
-          }
-        }
-      }
-    }
-  }
-  total = combos.length;
-
-  for (const combo of combos) {
-    const p = { ...baseParams, ...combo };
+  for (let done = 0; done < combos.length; done++) {
+    const combo = normalizeParams(combos[done], Object.keys(ranges));
+    const p = normalizeParams({ ...baseParams, ...combo });
     try {
       const r = runBacktest(candles, p);
       const s = r.stats;
-      if (!isProfitableBacktest(s, r.equityCurve, p.startEquity ?? baseParams.startEquity ?? 10000)) {
-        done++;
-        if (onProgress) onProgress(Math.round((done / total) * 100));
+      const netReturn = parseFloat(s.netReturn);
+      if (!Number.isFinite(netReturn) || netReturn <= 0) {
+        if (onProgress) onProgress(Math.round(((done + 1) / total) * 100));
         continue;
       }
       results.push({
         params: combo,
-        netReturn: parseFloat(s.netReturn),
+        netReturn,
         sharpe: s.sharpe === "—" ? -999 : parseFloat(s.sharpe),
         maxDD: parseFloat(s.maxDD),
         profitFactor: s.profitFactor === "∞" ? 999 : parseFloat(s.profitFactor),
         totalTrades: s.totalTrades,
         winRate: parseFloat(s.winRate),
         calmar: s.calmar === "—" ? -999 : parseFloat(s.calmar),
-        score: (parseFloat(s.netReturn) * 0.3)
+        score: (netReturn * 0.3)
           + (s.sharpe === "—" ? 0 : parseFloat(s.sharpe) * 10)
           - parseFloat(s.maxDD) * 0.5
           + Math.min(s.profitFactor === "∞" ? 0 : parseFloat(s.profitFactor), 5) * 5,
       });
-    } catch (_e) { }
-    done++;
-    if (onProgress) onProgress(Math.round((done / total) * 100));
+    } catch (_e) { /* skip invalid combo */ }
+    if (onProgress) onProgress(Math.round(((done + 1) / total) * 100));
   }
 
   return results.sort((a, b) => b.score - a.score);
@@ -813,13 +796,13 @@ function runSmartOptimization(candles, baseParams, ranges, onProgress, options =
       baseParams,
       ranges,
       p => runBacktest(candles, p, htfAlignedDir),
-      { onProgress, regimeModel, compact },
+      { onProgress, regimeModel, compact, bounds: buildTuneBounds(compact) },
     );
     return { results: ml.results, mlMeta: ml };
   }
 
   return {
-    results: filterProfitableResults(runOptimization(candles, baseParams, ranges, onProgress)),
+    results: runOptimization(candles, baseParams, ranges, onProgress, compact),
     mlMeta: null,
   };
 }
@@ -833,24 +816,156 @@ function attachMLSignalFilter(trainCandles, segParams, htfAlignedDir) {
   return { ...segParams, mlModel };
 }
 
-const ADAPTIVE_CORE_KEYS = ["atrPeriod", "erLength", "smoothLength", "minFactor", "maxFactor"];
+const AUTO_TUNE_KEYS = [
+  "atrPeriod", "erLength", "smoothLength", "minFactor", "maxFactor",
+  "useRegimeFilter", "chopThreshold", "useVWER",
+  "useTrailingStop", "useBreakEven", "breakEvenPct",
+  "useATRSizing", "atrMult", "useMLFilter", "mlThreshold", "riskPct",
+];
+
+const BOOL_TUNE_KEYS = new Set([
+  "useRegimeFilter", "useVWER", "useTrailingStop", "useBreakEven", "useATRSizing", "useMLFilter",
+]);
+
+function fullParamsKey(params) {
+  const p = normalizeParams(params, AUTO_TUNE_KEYS);
+  return AUTO_TUNE_KEYS.map(k => `${k}:${p[k]}`).join("|");
+}
+
+function mergeProfitableParamHistory(existing, incoming) {
+  const merged = existing.map(e => ({ ...e, windows: [...(e.windows || [e.window])] }));
+  for (const entry of incoming) {
+    if (!entry.confirmed) continue;
+    const idx = merged.findIndex(e => fullParamsKey(e.params) === fullParamsKey(entry.params));
+    if (idx >= 0) {
+      const prev = merged[idx];
+      merged[idx] = {
+        ...prev,
+        hits: (prev.hits || 1) + 1,
+        lastBar: entry.bar,
+        lastBarEnd: entry.barEnd,
+        lastSegmentReturn: entry.segmentReturn,
+        lastEquityEnd: entry.equityEnd,
+        windows: [...(prev.windows || []), entry.window],
+      };
+    } else {
+      merged.push({
+        ...entry,
+        hits: 1,
+        windows: [entry.window],
+      });
+    }
+  }
+  return merged.sort((a, b) => a.bar - b.bar);
+}
+
+function buildTuneEntry(fields) {
+  const entry = { confirmed: false, hits: 1, windows: [], ...fields };
+  if (entry.params) entry.params = normalizeParams(entry.params, AUTO_TUNE_KEYS);
+  return entry;
+}
+
+function tuneHistoryToOptResults(history) {
+  return history.map((t, i) => ({
+    params: normalizeParams(t.params, AUTO_TUNE_KEYS),
+    netReturn: t.lastSegmentReturn ?? t.segmentReturn ?? t.trainNetReturn ?? 0,
+    trainNetReturn: t.trainNetReturn ?? 0,
+    segmentReturn: t.lastSegmentReturn ?? t.segmentReturn ?? 0,
+    sharpe: t.sharpe ?? 0,
+    maxDD: t.maxDD ?? 0,
+    profitFactor: t.profitFactor ?? 0,
+    totalTrades: t.totalTrades ?? 0,
+    winRate: t.winRate ?? 0,
+    calmar: t.calmar ?? 0,
+    score: t.score ?? 0,
+    window: t.window ?? i + 1,
+    bar: t.lastBar ?? t.bar,
+    hits: t.hits ?? 1,
+    windows: t.windows ?? [t.window],
+    equityEnd: t.lastEquityEnd ?? t.equityEnd,
+  }));
+}
 
 function buildOptRanges(compact = false) {
-  if (compact) {
-    return {
-      atrPeriod: [8, 10, 14],
-      erLength: [10, 14, 20],
-      smoothLength: [3, 5, 8],
-      minFactor: [1.0, 1.5, 2.0, 2.5],
-      maxFactor: [3.0, 4.0, 5.0, 6.0],
-    };
-  }
   return {
-    atrPeriod: [7, 10, 14, 18, 21],
-    erLength: [8, 14, 20, 28],
-    smoothLength: [3, 5, 8, 13],
-    minFactor: [1.0, 1.5, 2.0, 2.5],
-    maxFactor: [3.0, 4.0, 5.0, 6.0, 7.0],
+    atrPeriod: compact ? [8, 10, 14] : [7, 10, 14, 18, 21],
+    erLength: compact ? [10, 14, 20] : [8, 14, 20, 28],
+    smoothLength: compact ? [3, 5, 8] : [3, 5, 8, 13],
+    minFactor: compact ? [1.0, 1.5, 2.0, 2.5] : [1.0, 1.5, 2.0, 2.5],
+    maxFactor: compact ? [3.0, 4.0, 5.0, 6.0] : [3.0, 4.0, 5.0, 6.0, 7.0],
+    chopThreshold: compact ? [55, 61.8, 68] : [50, 55, 61.8, 68, 75],
+    breakEvenPct: compact ? [0.5, 1.0, 2.0] : [0.5, 1.0, 1.5, 2.0, 3.0],
+    atrMult: compact ? [1.5, 2, 3] : [1, 1.5, 2, 2.5, 3, 4],
+    mlThreshold: compact ? [0.38, 0.42, 0.50] : [0.35, 0.38, 0.42, 0.48, 0.55],
+    riskPct: compact ? [0.01, 0.02] : [0.01, 0.02],
+    useRegimeFilter: [true, false],
+    useVWER: [true, false],
+    useTrailingStop: [true, false],
+    useBreakEven: [true, false],
+    useATRSizing: [true, false],
+    useMLFilter: [true, false],
+  };
+}
+
+function sampleParamCombo(ranges) {
+  const combo = {};
+  for (const [key, values] of Object.entries(ranges)) {
+    combo[key] = values[Math.floor(Math.random() * values.length)];
+  }
+  return normalizeParams(combo, Object.keys(ranges));
+}
+
+function buildParamCombos(ranges, compact = false) {
+  const keys = Object.keys(ranges);
+  let gridSize = 1;
+  for (const key of keys) gridSize *= ranges[key].length;
+
+  if (gridSize <= 500) {
+    const combos = [];
+    const build = (idx, current) => {
+      if (idx >= keys.length) {
+        const normalized = normalizeParams(current, keys);
+        if (normalized.minFactor < normalized.maxFactor) combos.push(normalized);
+        return;
+      }
+      const key = keys[idx];
+      for (const v of ranges[key]) build(idx + 1, { ...current, [key]: v });
+    };
+    build(0, {});
+    return combos;
+  }
+
+  const target = compact ? 160 : 280;
+  const combos = [];
+  const seen = new Set();
+  while (combos.length < target) {
+    const combo = sampleParamCombo(ranges);
+    const sig = fullParamsKey(combo);
+    if (seen.has(sig)) continue;
+    seen.add(sig);
+    combos.push(combo);
+  }
+  return combos;
+}
+
+function buildTuneBounds(compact = false) {
+  return {
+    atrPeriod: [5, 30],
+    erLength: [5, 50],
+    smoothLength: [1, 20],
+    minFactor: [0.5, 3.5],
+    maxFactor: [2, 9],
+    chopThreshold: [50, 80],
+    breakEvenPct: [0.5, 5],
+    atrMult: [1, 5],
+    mlThreshold: compact ? [0.35, 0.55] : [0.3, 0.7],
+    riskPct: compact ? [0.005, 0.015] : [0.005, 0.02],
+    useRegimeFilter: "bool",
+    useVWER: "bool",
+    useTrailingStop: "bool",
+    useBreakEven: "bool",
+    useATRSizing: "bool",
+    useMLFilter: "bool",
   };
 }
 
@@ -976,23 +1091,42 @@ function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedD
     );
     mlMeta = meta;
     const best = results[0];
-    const bestParams = best ? { ...baseParams, ...best.params } : baseParams;
+    const bestParams = best ? normalizeParams({ ...baseParams, ...best.params }) : baseParams;
     const filtered = best ? attachMLSignalFilter(candles, bestParams, htfAlignedDir) : bestParams;
     const result = runBacktest(candles, filtered, htfAlignedDir);
+    const finalEquity = result.equityCurve.filter(v => !isNaN(v)).at(-1) ?? startEquity;
+    const segmentReturn = startEquity > 0 ? ((finalEquity - startEquity) / startEquity) * 100 : 0;
+    const tuneLog = [];
+    const profitableParamHistory = [];
+
+    if (best && segmentReturn > 0 && finalEquity > startEquity) {
+      const entry = buildTuneEntry({
+        window: 1,
+        bar: 0,
+        barEnd: n - 1,
+        params: normalizeParams({ ...best.params }),
+        score: best.score,
+        trainNetReturn: best.netReturn,
+        segmentReturn,
+        equityStart: startEquity,
+        equityEnd: finalEquity,
+        regime: best.regime,
+        method: useML ? "genetic" : "grid",
+        confirmed: true,
+        windows: [1],
+      });
+      tuneLog.push(entry);
+      profitableParamHistory.push({ ...entry });
+    }
+
     return {
       ...result,
       adaptive: true,
       mlPowered: useML,
       mlMeta,
-      tunedParams: best?.params ?? null,
-      tuneLog: best ? [{
-        bar: 0,
-        params: { ...best.params },
-        score: best.score,
-        netReturn: best.netReturn,
-        regime: best.regime,
-        method: useML ? "genetic" : "grid",
-      }] : [],
+      tunedParams: profitableParamHistory.at(-1)?.params ?? best?.params ?? null,
+      tuneLog,
+      profitableParamHistory,
       adaptiveConfig: config,
       regimeModel,
     };
@@ -1008,9 +1142,11 @@ function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedD
   const allTrades = [];
   const allDrawdowns = [];
   const tuneLog = [];
+  const profitableParamHistory = [];
   let equity = startEquity;
   let cursor = 0;
   let lastGoodParams = baseParams;
+  let windowNum = 0;
   const totalSteps = Math.max(1, Math.ceil((n - lookback) / retuneEvery) + 1);
   let step = 0;
 
@@ -1022,8 +1158,10 @@ function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedD
     const trainEnd = segStart === 0 ? segEnd : segStart;
     const trainStart = Math.max(0, trainEnd - lookback);
     const trainCandles = candles.slice(trainStart, trainEnd);
+    const equityBeforeSeg = equity;
 
     let segParams = lastGoodParams;
+    let best = null;
     if (trainCandles.length >= 50) {
       const { results, mlMeta: meta } = runSmartOptimization(
         trainCandles, baseParams, optRanges,
@@ -1031,19 +1169,8 @@ function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedD
         { useML, regimeModel, compact, htfAlignedDir: null },
       );
       if (meta && !mlMeta) mlMeta = meta;
-      const best = results[0];
-      if (best) {
-        lastGoodParams = { ...baseParams, ...best.params };
-        segParams = attachMLSignalFilter(trainCandles, lastGoodParams, null);
-        tuneLog.push({
-          bar: segStart,
-          params: { ...best.params },
-          score: best.score,
-          netReturn: best.netReturn,
-          regime: best.regime ?? meta?.regime?.label,
-          method: useML ? "genetic" : "grid",
-        });
-      }
+      best = results[0] ?? null;
+      if (best) segParams = attachMLSignalFilter(trainCandles, normalizeParams({ ...baseParams, ...best.params }), null);
     }
 
     const warmup = Math.max(0, segStart - lookback);
@@ -1069,7 +1196,34 @@ function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedD
     }
     allDrawdowns.push(...seg.drawdowns);
 
-    equity = seg.equityCurve[slice.length - 1] ?? equity;
+    const equityAfterSeg = seg.equityCurve[slice.length - 1] ?? equity;
+    const segmentReturn = equityBeforeSeg > 0
+      ? ((equityAfterSeg - equityBeforeSeg) / equityBeforeSeg) * 100
+      : 0;
+
+    if (best && segmentReturn > 0 && equityAfterSeg > equityBeforeSeg) {
+      windowNum++;
+      lastGoodParams = segParams;
+      const entry = buildTuneEntry({
+        window: windowNum,
+        bar: segStart,
+        barEnd: segEnd - 1,
+        params: normalizeParams({ ...best.params }),
+        score: best.score,
+        trainNetReturn: best.netReturn,
+        segmentReturn,
+        equityStart: equityBeforeSeg,
+        equityEnd: equityAfterSeg,
+        regime: best.regime,
+        method: useML ? "genetic" : "grid",
+        confirmed: true,
+        windows: [windowNum],
+      });
+      tuneLog.push(entry);
+      profitableParamHistory.push({ ...entry });
+    }
+
+    equity = equityAfterSeg;
     cursor = segEnd;
     step++;
     if (onProgress) onProgress(Math.round((step / totalSteps) * 100));
@@ -1079,7 +1233,9 @@ function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedD
     if (isNaN(mergedEquity[i])) mergedEquity[i] = i > 0 ? mergedEquity[i - 1] : startEquity;
   }
 
-  const latestParams = tuneLog.length ? tuneLog[tuneLog.length - 1].params : null;
+  const latestParams = profitableParamHistory.length
+    ? profitableParamHistory[profitableParamHistory.length - 1].params
+    : tuneLog.at(-1)?.params ?? null;
   const result = assembleBacktestResult(
     candles,
     latestParams ? { ...baseParams, ...latestParams } : baseParams,
@@ -1097,6 +1253,7 @@ function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedD
     mlMeta,
     tunedParams: latestParams,
     tuneLog,
+    profitableParamHistory,
     adaptiveConfig: config,
     regimeModel,
   };
@@ -1449,7 +1606,7 @@ function ERChart({ result, width, height, minFactor, maxFactor, viewRange, showC
     ctx.fillStyle = C.purple; ctx.fillText("ER", pL + W + 3, pT + 10);
     ctx.fillStyle = C.yellow; ctx.fillText("F×", pL + W + 3, pT + H - 4);
     ctx.fillStyle = C.sub;
-    [minFactor, maxFactor].forEach(v => ctx.fillText(v.toFixed(1), pL + W + 20, sfY(v) + 3));
+    [minFactor, maxFactor].forEach(v => ctx.fillText(v.toFixed(2), pL + W + 20, sfY(v) + 3));
     if (showCI) { ctx.fillStyle = C.red + "88"; ctx.fillText("CI", pL + W + 3, pT + H / 2); }
   }, [result, width, height, minFactor, maxFactor, viewRange, showCI]);
 
@@ -1673,9 +1830,9 @@ function OptimizationHeatmap({ results, width, height }) {
     });
 
     ctx.fillStyle = C.sub; ctx.font = "8px monospace"; ctx.textAlign = "center";
-    maxFs.forEach((v, i) => ctx.fillText(v.toFixed(1), 40 + i * cellW + cellW / 2, 16));
+    maxFs.forEach((v, i) => ctx.fillText(v.toFixed(2), 40 + i * cellW + cellW / 2, 16));
     ctx.fillStyle = C.sub; ctx.font = "8px monospace"; ctx.textAlign = "right";
-    minFs.forEach((v, i) => ctx.fillText(v.toFixed(1), 36, 20 + i * cellH + cellH / 2 + 3));
+    minFs.forEach((v, i) => ctx.fillText(v.toFixed(2), 36, 20 + i * cellH + cellH / 2 + 3));
 
     ctx.fillStyle = C.label; ctx.font = "8px monospace"; ctx.textAlign = "center";
     ctx.fillText("maxF →", 40 + (maxFs.length * cellW) / 2, height - 4);
@@ -1813,8 +1970,9 @@ function Toggle({ label, value, onChange, color }) {
 }
 
 // ─── Pine Script Export ───────────────────────────────────────────────────────
-function PineModal({ params, onClose }) {
+function PineModal({ params: rawParams, onClose }) {
   const [copied, setCopied] = useState(false);
+  const params = normalizeParams(rawParams);
   const script = `// ============================================
 // Adaptive Supertrend PRO v2.1
 // ============================================
@@ -1831,16 +1989,16 @@ strategy(
 
 // ── Inputs ──
 atrPeriod    = input.int(${params.atrPeriod},   "ATR Period",    minval=1)
-minFactor    = input.float(${params.minFactor}, "Min Multiplier",step=0.1)
-maxFactor    = input.float(${params.maxFactor}, "Max Multiplier",step=0.1)
+minFactor    = input.float(${params.minFactor.toFixed(2)}, "Min Multiplier",step=0.01)
+maxFactor    = input.float(${params.maxFactor.toFixed(2)}, "Max Multiplier",step=0.01)
 erLength     = input.int(${params.erLength},    "ER Window",     minval=2)
 smoothLength = input.int(${params.smoothLength},"EMA Smooth",    minval=1)
 useRegime    = input.bool(${params.useRegimeFilter || false}, "Regime Filter")
-chopThreshold= input.float(${params.chopThreshold || 61.8}, "Chop Threshold", minval=50, maxval=80)
+chopThreshold= input.float(${Number(params.chopThreshold || 61.8).toFixed(2)}, "Chop Threshold", minval=50, maxval=80)
 useVWER      = input.bool(${params.useVWER || false}, "Volume-Weighted ER")
 useTrailing  = input.bool(${params.useTrailingStop || false}, "Trailing Stop")
 useBreakEven = input.bool(${params.useBreakEven || false}, "Break-Even Stop")
-bePct        = input.float(${params.breakEvenPct || 1.0}, "BE Trigger %", step=0.5)
+bePct        = input.float(${Number(params.breakEvenPct || 1.0).toFixed(2)}, "BE Trigger %", step=0.01)
 
 // ── ER ──
 f_vwer(len) =>
@@ -2048,8 +2206,8 @@ function WalkForwardTable({ wfResults }) {
                 <td style={{ padding: "4px 8px", color: C.label }}>{fmtDate(candlesRef[r.testStart]?.t)} to {fmtDate(candlesRef[r.testEnd]?.t)}</td>
                 <td style={{ padding: "4px 8px", textAlign: "right", fontFamily: "monospace", color: C.text }}>{r.bestParams.atrPeriod}</td>
                 <td style={{ padding: "4px 8px", textAlign: "right", fontFamily: "monospace", color: C.text }}>{r.bestParams.erLength}</td>
-                <td style={{ padding: "4px 8px", textAlign: "right", fontFamily: "monospace", color: C.accent }}>{r.bestParams.minFactor.toFixed(1)}</td>
-                <td style={{ padding: "4px 8px", textAlign: "right", fontFamily: "monospace", color: C.red }}>{r.bestParams.maxFactor.toFixed(1)}</td>
+                <td style={{ padding: "4px 8px", textAlign: "right", fontFamily: "monospace", color: C.accent }}>{fmtParamValue("minFactor", r.bestParams.minFactor)}</td>
+                <td style={{ padding: "4px 8px", textAlign: "right", fontFamily: "monospace", color: C.red }}>{fmtParamValue("maxFactor", r.bestParams.maxFactor)}</td>
                 <td style={{ padding: "4px 8px", textAlign: "right", fontFamily: "monospace", fontWeight: 700, color: r.oosReturn >= 0 ? C.accent : C.red }}>{r.oosReturn.toFixed(1)}%</td>
                 <td style={{ padding: "4px 8px", textAlign: "right", fontFamily: "monospace", color: C.yellow }}>{r.oosSharpe.toFixed(2)}</td>
                 <td style={{ padding: "4px 8px", textAlign: "right", fontFamily: "monospace", color: C.sub }}>{r.testStats.totalTrades}</td>
@@ -2121,10 +2279,11 @@ export default function App() {
   const [wfRunning, setWfRunning] = useState(false);
 
   const [autoTune, setAutoTune] = useState(true);
-  const [useML, setUseML] = useState(true);
   const [tuning, setTuning] = useState(false);
   const [tuneProgress, setTuneProgress] = useState(0);
   const [tuneLog, setTuneLog] = useState(null);
+  const [profitableParams, setProfitableParams] = useState([]);
+  const profitableParamsRef = useRef([]);
   const [retuneToken, setRetuneToken] = useState(0);
 
   const [params, setParams] = useState({
@@ -2150,22 +2309,12 @@ export default function App() {
   paramsRef.current = params;
 
   const adaptiveSettingsKey = useMemo(() => JSON.stringify({
-    useRegimeFilter: params.useRegimeFilter,
-    useVWER: params.useVWER,
-    useTrailingStop: params.useTrailingStop,
-    useBreakEven: params.useBreakEven,
-    breakEvenPct: params.breakEvenPct,
-    useATRSizing: params.useATRSizing,
-    atrMult: params.atrMult,
-    sessionFilter: params.sessionFilter,
-    chopThreshold: params.chopThreshold,
-    riskPct: params.riskPct,
     startEquity: params.startEquity,
-    minStopPct: params.minStopPct,
     barsPerYear: params.barsPerYear,
-    useMLFilter: params.useMLFilter,
-    mlThreshold: params.mlThreshold,
-  }), [params]);
+    sessionFilter: params.sessionFilter,
+    sessionHours: params.sessionHours,
+    minStopPct: params.minStopPct,
+  }), [params.startEquity, params.barsPerYear, params.sessionFilter, params.sessionHours, params.minStopPct]);
 
   const [viewRange, setViewRange] = useState([0, 0]);
   const containerRef = useRef(null);
@@ -2218,29 +2367,24 @@ export default function App() {
           config,
           htfAligned,
           p => { if (!cancelled) setTuneProgress(p); },
-          { useML },
         );
 
         if (cancelled) return;
 
+        const confirmed = (r.profitableParamHistory || []).filter(e => e.confirmed);
+        const mergedHistory = mergeProfitableParamHistory(profitableParamsRef.current, confirmed);
+        profitableParamsRef.current = mergedHistory;
+
         setResult(r);
         setTuneLog(r.tuneLog);
-        setOptResults(r.tuneLog?.length ? [{
-          params: r.tunedParams,
-          netReturn: parseFloat(r.stats.netReturn),
-          sharpe: r.stats.sharpe === "—" ? -999 : parseFloat(r.stats.sharpe),
-          maxDD: parseFloat(r.stats.maxDD),
-          profitFactor: r.stats.profitFactor === "∞" ? 999 : parseFloat(r.stats.profitFactor),
-          totalTrades: r.stats.totalTrades,
-          winRate: parseFloat(r.stats.winRate),
-          calmar: r.stats.calmar === "—" ? -999 : parseFloat(r.stats.calmar),
-          score: r.tuneLog?.at(-1)?.score ?? 0,
-        }] : null);
+        setProfitableParams(mergedHistory);
+        setOptResults(mergedHistory.length ? tuneHistoryToOptResults(mergedHistory) : null);
 
-        if (r.tunedParams) {
+        const latest = mergedHistory.at(-1);
+        if (latest?.params) {
           setParams(p => {
-            const next = { ...p, ...r.tunedParams };
-            return ADAPTIVE_CORE_KEYS.some(k => p[k] !== next[k]) ? next : p;
+            const next = { ...p, ...latest.params };
+            return AUTO_TUNE_KEYS.some(k => p[k] !== next[k]) ? next : p;
           });
         }
       } catch (e) {
@@ -2257,7 +2401,7 @@ export default function App() {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [candles, adaptiveSettingsKey, htfResult, htfMultiplier, htfCandles, autoTune, retuneToken, useML]);
+  }, [candles, adaptiveSettingsKey, htfResult, htfMultiplier, htfCandles, autoTune, retuneToken]);
 
   // Reset view range
   useEffect(() => {
@@ -2272,6 +2416,8 @@ export default function App() {
     setLoading(true); setError(""); setProgress(0);
     setCandles([]); setResult(null); setOptResults(null); setMcResults(null); setWfResults(null);
     setHtfCandles(null); setHtfResult(null); setTuneLog(null);
+    setProfitableParams([]);
+    profitableParamsRef.current = [];
 
     const intervalMs = INTERVALS.find(i => i.label === interval)?.ms ?? 3600e3;
     const barsPerYear = Math.max(1, Math.round((365.25 * 86400e3) / intervalMs));
@@ -2294,11 +2440,11 @@ export default function App() {
         try {
           const htfData = await fetchKlines(symbol, htfLabel, startMs, endMs);
           setHtfCandles(htfData);
-          const p = paramsRef.current;
-          const htfAtr = atrRMA(htfData, p.atrPeriod);
-          const htfEr = p.useVWER ? volumeWeightedER(htfData, p.erLength) : kaufmanER(htfData, p.erLength);
-          const htfRawF = htfEr.map(e => p.maxFactor - e * (p.maxFactor - p.minFactor));
-          const htfSmoothF = ema(htfRawF, p.smoothLength);
+          // Compute ST on HTF
+          const htfAtr = atrRMA(htfData, params.atrPeriod);
+          const htfEr = params.useVWER ? volumeWeightedER(htfData, params.erLength) : kaufmanER(htfData, params.erLength);
+          const htfRawF = htfEr.map(e => params.maxFactor - e * (params.maxFactor - params.minFactor));
+          const htfSmoothF = ema(htfRawF, params.smoothLength);
           const htfST = adaptiveST(htfData, htfAtr, htfSmoothF);
           setHtfResult(htfST);
         } catch (e) {
@@ -2310,29 +2456,14 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [symbol, interval, startDate, endDate, htfMultiplier]);
-
-  useEffect(() => {
-    const timer = setTimeout(() => { fetch(); }, 350);
-    return () => clearTimeout(timer);
-  }, [fetch]);
-
-  useEffect(() => {
-    if (!htfCandles?.length || htfMultiplier <= 0) return;
-    const p = paramsRef.current;
-    const htfAtr = atrRMA(htfCandles, p.atrPeriod);
-    const htfEr = p.useVWER ? volumeWeightedER(htfCandles, p.erLength) : kaufmanER(htfCandles, p.erLength);
-    const htfRawF = htfEr.map(e => p.maxFactor - e * (p.maxFactor - p.minFactor));
-    const htfSmoothF = ema(htfRawF, p.smoothLength);
-    setHtfResult(adaptiveST(htfCandles, htfAtr, htfSmoothF));
-  }, [htfCandles, htfMultiplier, params.atrPeriod, params.erLength, params.smoothLength, params.minFactor, params.maxFactor, params.useVWER]);
+  }, [symbol, interval, startDate, endDate, htfMultiplier, params]);
 
   const applyPreset = useCallback(days => {
     setEndDate(toISO(now));
     setStartDate(toISO(now - days * 86400e3));
   }, []);
 
-  const setP = k => v => setParams(p => ({ ...p, [k]: v }));
+  const setP = k => v => setParams(p => normalizeParams({ ...p, [k]: v }));
 
   // ── Run optimization ──
   const runOpt = useCallback(async () => {
@@ -2341,18 +2472,17 @@ export default function App() {
     const ranges = buildOptRanges(candles.length > 2500);
     setTimeout(() => {
       try {
-        const regimeModel = buildRegimeModel(candles);
-        const { results } = runSmartOptimization(
+        const results = runSmartOptimization(
           candles, params, ranges, p => setOptProgress(p),
-          { useML, regimeModel, compact: candles.length > 2500, htfAlignedDir: null },
-        );
+          { useML: true, compact: candles.length > 2500, htfAlignedDir: null },
+        ).results;
         setOptResults(results.slice(0, 20));
       } catch (e) {
         setError("Optimization failed: " + e.message);
       }
       setOptRunning(false);
     }, 50);
-  }, [candles, params, useML]);
+  }, [candles, params]);
 
   // ── Run Monte Carlo ──
   const runMC = useCallback(() => {
@@ -2390,14 +2520,10 @@ export default function App() {
   const lastER = result?.er?.filter(v => !isNaN(v)).at(-1) ?? 0;
   const lastF = result?.smoothF?.filter(v => !isNaN(v)).at(-1) ?? 0;
   const lastCI = result?.ci?.filter(v => !isNaN(v)).at(-1) ?? 50;
-  const candleCount = candles.length;
-  const mlFeatures = candleCount > 0 ? extractMarketFeatures(candles) : null;
-  const mlRegime = result?.regimeModel && mlFeatures
-    ? classifyRegime(mlFeatures, result.regimeModel)
-    : null;
-  const regime = mlRegime?.label ?? (lastER > 0.62 ? "Trending" : lastER > 0.38 ? "Mixed" : "Choppy");
-  const regimeColor = regime === "Trending" ? C.accent : regime === "Mixed" ? C.yellow : C.red;
+  const regime = lastER > 0.62 ? "Trending" : lastER > 0.38 ? "Mixed" : "Choppy";
+  const regimeColor = lastER > 0.62 ? C.accent : lastER > 0.38 ? C.yellow : C.red;
 
+  const candleCount = candles.length;
   const viewLen = viewRange[1] - viewRange[0];
 
   const moveView = dir => {
@@ -2449,7 +2575,7 @@ export default function App() {
           </div>
 
           <button onClick={fetch} disabled={loading || tuning} style={{ marginLeft: "auto", padding: "7px 20px", borderRadius: 7, cursor: loading || tuning ? "wait" : "pointer", background: loading || tuning ? C.border : C.accent + "22", border: `1px solid ${loading || tuning ? C.border : C.accent}66`, color: loading || tuning ? C.sub : C.accent, fontSize: 12, fontWeight: 700 }}>
-            {loading ? `Loading ${progress}%...` : tuning ? `${useML ? "ML tuning" : "Tuning"} ${tuneProgress}%...` : "Refresh"}
+            {loading ? `Loading ${progress}%...` : tuning ? `Auto-tuning ${tuneProgress}%...` : "Fetch & Run"}
           </button>
 
           <button onClick={() => setShowPine(true)} style={{ padding: "7px 14px", borderRadius: 7, cursor: "pointer", background: C.purple + "18", border: `1px solid ${C.purple}44`, color: C.purple, fontSize: 11, fontWeight: 600 }}>Pine</button>
@@ -2466,12 +2592,11 @@ export default function App() {
         {/* Sidebar */}
         <div style={{ width: 215, flexShrink: 0, borderRight: `1px solid ${C.border}`, padding: "16px 14px", background: C.panel, overflowY: "auto" }}>
 
-          <Toggle label="Auto-Tune (Runtime)" value={autoTune} onChange={setAutoTune} color={C.purple} />
-          <Toggle label="ML Engine (GA + Regime)" value={useML} onChange={setUseML} color={C.blue} />
+          <Toggle label="Auto-Tune (All Params)" value={autoTune} onChange={setAutoTune} color={C.purple} />
           {autoTune && (
             <div style={{ marginBottom: 14, padding: "8px 10px", borderRadius: 8, background: C.bg, border: `1px solid ${C.purple}44` }}>
               <div style={{ fontSize: 9, color: C.purple, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 6 }}>
-                {tuning ? `Tuning ${tuneProgress}%` : useML ? "ML Adaptive Active" : "Grid Adaptive Active"}
+                {tuning ? `Tuning ${tuneProgress}%` : "Adaptive Active"}
               </div>
               {result?.adaptiveConfig && (
                 <>
@@ -2479,17 +2604,11 @@ export default function App() {
                   <StatRow label="Re-tune every" value={`${result.adaptiveConfig.retuneEvery} bars`} color={C.sub} mono />
                 </>
               )}
-              {useML && mlRegime && (
-                <>
-                  <StatRow label="ML Regime" value={mlRegime.label} color={regimeColor} />
-                  <StatRow label="Confidence" value={`${(mlRegime.confidence * 100).toFixed(0)}%`} color={C.blue} mono />
-                </>
+              {profitableParams.length > 0 && (
+                <StatRow label="Profitable sets" value={profitableParams.length} color={C.accent} mono />
               )}
               {tuneLog?.length > 0 && (
                 <StatRow label="Tune windows" value={tuneLog.length} color={C.purple} mono />
-              )}
-              {tuneLog?.length > 0 && (
-                <StatRow label="Optimizer" value={tuneLog.at(-1)?.method ?? "—"} color={C.sub} mono />
               )}
               {candleCount > 0 && !tuning && (
                 <button onClick={() => setRetuneToken(t => t + 1)} style={{ marginTop: 8, width: "100%", padding: "5px 8px", borderRadius: 6, border: `1px solid ${C.purple}66`, background: C.purple + "18", color: C.purple, fontSize: 10, cursor: "pointer" }}>
@@ -2500,38 +2619,37 @@ export default function App() {
           )}
 
           <div style={{ fontSize: 9, color: C.sub, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 14 }}>
-            Core Parameters{autoTune ? " (auto)" : ""}
+            Strategy{autoTune ? " (all params auto-tuned)" : ""}
           </div>
           <Slider label="ATR Period" value={params.atrPeriod} min={5} max={30} step={1} onChange={setP("atrPeriod")} disabled={autoTune} />
-          <Slider label="Min Factor" value={params.minFactor} min={0.5} max={3.5} step={0.1} onChange={setP("minFactor")} unit="x" color={C.accent} disabled={autoTune} />
-          <Slider label="Max Factor" value={params.maxFactor} min={2.0} max={9.0} step={0.1} onChange={setP("maxFactor")} unit="x" color={C.red} disabled={autoTune} />
+          <Slider label="Min Factor" value={params.minFactor} min={0.5} max={3.5} step={0.01} onChange={setP("minFactor")} unit="x" color={C.accent} disabled={autoTune} />
+          <Slider label="Max Factor" value={params.maxFactor} min={2.0} max={9.0} step={0.01} onChange={setP("maxFactor")} unit="x" color={C.red} disabled={autoTune} />
 
           <div style={{ fontSize: 9, color: C.sub, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 14, marginTop: 16 }}>Efficiency Engine</div>
           <Slider label="ER Window" value={params.erLength} min={5} max={50} step={1} onChange={setP("erLength")} color={C.purple} disabled={autoTune} />
           <Slider label="EMA Smooth" value={params.smoothLength} min={1} max={20} step={1} onChange={setP("smoothLength")} color={C.yellow} disabled={autoTune} />
 
           <div style={{ fontSize: 9, color: C.sub, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 14, marginTop: 16 }}>Risk Management</div>
-          <Toggle label="Trailing Stop" value={params.useTrailingStop} onChange={setP("useTrailingStop")} color={C.blue} />
-          <Toggle label="Break-Even Stop" value={params.useBreakEven} onChange={setP("useBreakEven")} color={C.orange} />
+          <Toggle label="Trailing Stop" value={params.useTrailingStop} onChange={setP("useTrailingStop")} color={C.blue} disabled={autoTune} />
+          <Toggle label="Break-Even Stop" value={params.useBreakEven} onChange={setP("useBreakEven")} color={C.orange} disabled={autoTune} />
           {params.useBreakEven && (
-            <Slider label="BE Trigger %" value={params.breakEvenPct} min={0.5} max={5} step={0.5} onChange={setP("breakEvenPct")} color={C.orange} unit="%" />
+            <Slider label="BE Trigger %" value={params.breakEvenPct} min={0.5} max={5} step={0.01} onChange={setP("breakEvenPct")} color={C.orange} unit="%" disabled={autoTune} />
           )}
-          <Toggle label="ATR-Based Sizing" value={params.useATRSizing} onChange={setP("useATRSizing")} color={C.purple} />
+          <Toggle label="ATR-Based Sizing" value={params.useATRSizing} onChange={setP("useATRSizing")} color={C.purple} disabled={autoTune} />
           {params.useATRSizing && (
-            <Slider label="ATR Multiplier" value={params.atrMult} min={1} max={5} step={0.5} onChange={setP("atrMult")} color={C.purple} unit="x" />
+            <Slider label="ATR Multiplier" value={params.atrMult} min={1} max={5} step={0.01} onChange={setP("atrMult")} color={C.purple} unit="x" disabled={autoTune} />
           )}
+          <Slider label="Risk %" value={+(params.riskPct * 100).toFixed(2)} min={0.5} max={2} step={0.01} onChange={v => setP("riskPct")(v / 100)} color={C.yellow} unit="%" disabled={autoTune} />
 
           <div style={{ fontSize: 9, color: C.sub, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 14, marginTop: 16 }}>Filters</div>
-          <Toggle label="Regime Filter (CI)" value={params.useRegimeFilter} onChange={setP("useRegimeFilter")} color={C.blue} />
+          <Toggle label="Regime Filter (CI)" value={params.useRegimeFilter} onChange={setP("useRegimeFilter")} color={C.blue} disabled={autoTune} />
           {params.useRegimeFilter && (
-            <Slider label="Chop Threshold" value={params.chopThreshold} min={50} max={80} step={1} onChange={setP("chopThreshold")} color={C.blue} />
+            <Slider label="Chop Threshold" value={params.chopThreshold} min={50} max={80} step={0.01} onChange={setP("chopThreshold")} color={C.blue} disabled={autoTune} />
           )}
-          <Toggle label="Volume-Weighted ER" value={params.useVWER} onChange={setP("useVWER")} color={C.orange} />
-
-          <div style={{ fontSize: 9, color: C.sub, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 14, marginTop: 16 }}>ML Signal Filter</div>
-          <Toggle label="Logistic Filter" value={params.useMLFilter} onChange={setP("useMLFilter")} color={C.blue} />
+          <Toggle label="Volume-Weighted ER" value={params.useVWER} onChange={setP("useVWER")} color={C.orange} disabled={autoTune} />
+          <Toggle label="Logistic Filter" value={params.useMLFilter} onChange={setP("useMLFilter")} color={C.blue} disabled={autoTune} />
           {params.useMLFilter && (
-            <Slider label="ML Threshold" value={params.mlThreshold} min={0.3} max={0.7} step={0.02} onChange={setP("mlThreshold")} color={C.blue} />
+            <Slider label="ML Threshold" value={params.mlThreshold} min={0.3} max={0.7} step={0.01} onChange={setP("mlThreshold")} color={C.blue} disabled={autoTune} />
           )}
 
           <div style={{ fontSize: 9, color: C.sub, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 14, marginTop: 16 }}>Multi-Timeframe</div>
@@ -2554,9 +2672,6 @@ export default function App() {
             <StatRow label="Factor" value={lastF.toFixed(2) + "x"} color={C.yellow} mono />
             <StatRow label="Choppiness" value={lastCI.toFixed(1)} color={lastCI > 61.8 ? C.red : lastCI > 50 ? C.yellow : C.accent} mono />
             <StatRow label="Regime" value={regime} color={regimeColor} />
-            {mlRegime && useML && (
-              <StatRow label="ML Confidence" value={`${(mlRegime.confidence * 100).toFixed(0)}%`} color={C.blue} mono />
-            )}
             {candleCount > 0 && <StatRow label="Bars" value={candleCount.toLocaleString()} color={C.sub} mono />}
           </div>
 
@@ -2605,22 +2720,13 @@ export default function App() {
         {/* Main Content */}
         <div ref={containerRef} style={{ flex: 1, padding: "14px 16px", overflow: "hidden" }}>
 
-          {!candleCount && (loading || tuning) && (
+          {!candleCount && !loading && (
             <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: 300, color: C.sub, gap: 12 }}>
               <div style={{ fontSize: 28, color: C.accent, fontWeight: 700 }}>Adaptive Supertrend PRO</div>
-              <div style={{ fontSize: 13, color: C.label }}>
-                {loading ? `Fetching ${symbol} ${interval}… ${progress}%` : `${useML ? "ML tuning" : "Tuning"}… ${tuneProgress}%`}
-              </div>
-            </div>
-          )}
-
-          {!candleCount && !loading && !tuning && (
-            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: 300, color: C.sub, gap: 12 }}>
-              <div style={{ fontSize: 28, color: C.accent, fontWeight: 700 }}>Adaptive Supertrend PRO</div>
-              <div style={{ fontSize: 13, color: C.label }}>Auto-loads on startup — change symbol, interval, or dates to re-run</div>
+              <div style={{ fontSize: 13, color: C.label }}>Select symbol, interval & date range, then click Fetch & Run</div>
               <div style={{ fontSize: 11, color: C.sub }}>Pulls live OHLCV from Binance FAPI — no key needed</div>
               <div style={{ fontSize: 10, color: C.sub + "88", marginTop: 8, textAlign: "center", lineHeight: 1.6 }}>
-                v2.3: ML Genetic Optimizer &middot; K-Means Regime &middot; Logistic Signal Filter &middot; Runtime Auto-Tune
+                v2.2: Runtime Auto-Tune &middot; Rolling Walk-Forward Params &middot; Trailing Stops &middot; Monte Carlo &middot; Multi-TF Confluence
               </div>
             </div>
           )}
@@ -2698,7 +2804,9 @@ export default function App() {
                     <div style={{ padding: "12px 14px" }}>
                       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
                         <span style={{ fontSize: 11, color: C.label }}>
-                          {autoTune ? "Auto-Tune — profitable params only (+PnL & equity)" : "Parameter Optimization — profitable results only"}
+                          {autoTune
+                            ? `Captured profitable params (${profitableParams.length} unique, ${tuneLog?.length ?? 0} windows)`
+                            : "Parameter Optimization (minF x maxF heatmap)"}
                         </span>
                         <button onClick={runOpt} disabled={optRunning} style={{ padding: "5px 14px", borderRadius: 6, border: `1px solid ${optRunning ? C.border : C.accent}66`, background: optRunning ? C.border : C.accent + "22", color: optRunning ? C.sub : C.accent, fontSize: 11, cursor: optRunning ? "wait" : "pointer" }}>
                           {optRunning ? `Running ${optProgress}%...` : "Run Optimization"}
@@ -2706,42 +2814,46 @@ export default function App() {
                       </div>
                       {optResults && (
                         <>
-                          <OptimizationHeatmap results={optResults} width={chartW - 60} height={200} />
-                          <div style={{ marginTop: 10, maxHeight: 250, overflow: "auto" }}>
+                          {optResults.length > 1 && (
+                            <OptimizationHeatmap results={optResults} width={chartW - 60} height={200} />
+                          )}
+                          <div style={{ marginTop: 10, maxHeight: 280, overflow: "auto" }}>
                             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 9 }}>
                               <thead>
                                 <tr style={{ borderBottom: `1px solid ${C.border}` }}>
-                                  <th style={{ padding: "4px 6px", color: C.sub, textAlign: "left" }}>Rank</th>
+                                  <th style={{ padding: "4px 6px", color: C.sub, textAlign: "left" }}>Win</th>
+                                  <th style={{ padding: "4px 6px", color: C.sub, textAlign: "left" }}>Bar</th>
                                   <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>ATR</th>
                                   <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>ER</th>
                                   <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>Sm</th>
                                   <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>minF</th>
                                   <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>maxF</th>
-                                  <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>Return</th>
-                                  <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>Sharpe</th>
-                                  <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>PF</th>
-                                  <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>DD</th>
+                                  <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>Seg%</th>
+                                  <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>Hits</th>
+                                  <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>Equity</th>
                                 </tr>
                               </thead>
                               <tbody>
-                                {optResults.slice(0, 10).map((r, i) => (
+                                {optResults.map((r, i) => (
                                   <tr key={i} style={{ borderBottom: `1px solid ${C.border}11`, background: i === 0 ? C.accent + "11" : "transparent", cursor: "pointer" }}
-                                    onClick={() => { setParams(p => ({ ...p, ...r.params })); }}>
-                                    <td style={{ padding: "4px 6px", color: i === 0 ? C.accent : C.sub, fontWeight: i === 0 ? 700 : 400 }}>#{i + 1}</td>
-                                    <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.label }}>{r.params.atrPeriod}</td>
-                                    <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.label }}>{r.params.erLength}</td>
-                                    <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.label }}>{r.params.smoothLength}</td>
-                                    <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.accent }}>{r.params.minFactor.toFixed(1)}</td>
-                                    <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.red }}>{r.params.maxFactor.toFixed(1)}</td>
+                                    onClick={() => { setParams(p => normalizeParams({ ...p, ...r.params })); }}>
+                                    <td style={{ padding: "4px 6px", color: C.sub, fontFamily: "monospace" }}>#{r.window ?? i + 1}</td>
+                                    <td style={{ padding: "4px 6px", color: C.label, fontFamily: "monospace", fontSize: 8 }}>{r.bar ?? "—"}</td>
+                                    <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.label }}>{fmtParamValue("atrPeriod", r.params.atrPeriod)}</td>
+                                    <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.label }}>{fmtParamValue("erLength", r.params.erLength)}</td>
+                                    <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.label }}>{fmtParamValue("smoothLength", r.params.smoothLength)}</td>
+                                    <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.accent }}>{fmtParamValue("minFactor", r.params.minFactor)}</td>
+                                    <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.red }}>{fmtParamValue("maxFactor", r.params.maxFactor)}</td>
                                     <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", fontWeight: 700, color: r.netReturn >= 0 ? C.accent : C.red }}>{r.netReturn.toFixed(1)}%</td>
-                                    <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.yellow }}>{r.sharpe.toFixed(2)}</td>
-                                    <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.text }}>{r.profitFactor.toFixed(2)}</td>
-                                    <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.red }}>{r.maxDD.toFixed(1)}%</td>
+                                    <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.purple }}>{r.hits ?? 1}</td>
+                                    <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.sub, fontSize: 8 }}>{r.equityEnd ? `$${Math.round(r.equityEnd)}` : "—"}</td>
                                   </tr>
                                 ))}
                               </tbody>
                             </table>
-                            <div style={{ marginTop: 6, fontSize: 9, color: C.sub }}>Click any row to apply parameters</div>
+                            <div style={{ marginTop: 6, fontSize: 9, color: C.sub }}>
+                              {autoTune ? "All profitable retune windows — persists across Re-tune. Click row to apply." : "Click any row to apply parameters"}
+                            </div>
                           </div>
                         </>
                       )}
@@ -2816,8 +2928,8 @@ export default function App() {
                                   </td>
                                   <td style={{ padding: "4px 8px", textAlign: "right", fontFamily: "monospace", color: C.text }}>{r.bestParams.atrPeriod}</td>
                                   <td style={{ padding: "4px 8px", textAlign: "right", fontFamily: "monospace", color: C.text }}>{r.bestParams.erLength}</td>
-                                  <td style={{ padding: "4px 8px", textAlign: "right", fontFamily: "monospace", color: C.accent }}>{r.bestParams.minFactor.toFixed(1)}</td>
-                                  <td style={{ padding: "4px 8px", textAlign: "right", fontFamily: "monospace", color: C.red }}>{r.bestParams.maxFactor.toFixed(1)}</td>
+                                  <td style={{ padding: "4px 8px", textAlign: "right", fontFamily: "monospace", color: C.accent }}>{fmtParamValue("minFactor", r.bestParams.minFactor)}</td>
+                                  <td style={{ padding: "4px 8px", textAlign: "right", fontFamily: "monospace", color: C.red }}>{fmtParamValue("maxFactor", r.bestParams.maxFactor)}</td>
                                   <td style={{ padding: "4px 8px", textAlign: "right", fontFamily: "monospace", fontWeight: 700, color: r.oosReturn >= 0 ? C.accent : C.red }}>{r.oosReturn.toFixed(1)}%</td>
                                   <td style={{ padding: "4px 8px", textAlign: "right", fontFamily: "monospace", color: C.yellow }}>{r.oosSharpe.toFixed(2)}</td>
                                   <td style={{ padding: "4px 8px", textAlign: "right", fontFamily: "monospace", color: C.sub }}>{r.testStats.totalTrades}</td>

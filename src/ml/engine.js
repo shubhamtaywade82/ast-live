@@ -6,6 +6,59 @@ function clamp(v, lo, hi) {
   return Math.max(lo, Math.min(hi, v));
 }
 
+const PARAM_BOOL_KEYS = new Set([
+  "useRegimeFilter", "useVWER", "useTrailingStop", "useBreakEven", "useATRSizing", "useMLFilter",
+]);
+
+const PARAM_INT_KEYS = new Set(["atrPeriod", "erLength", "smoothLength"]);
+
+const PARAM_STEP = 0.01;
+
+export function roundParamValue(key, value) {
+  if (PARAM_BOOL_KEYS.has(key)) return !!value;
+  if (PARAM_INT_KEYS.has(key)) return Math.round(Number(value));
+  const n = Number(value);
+  if (!Number.isFinite(n)) return value;
+  return Math.round(n * 100) / 100;
+}
+
+export function fmtParamValue(key, value) {
+  if (value == null) return "—";
+  if (typeof value === "boolean") return value ? "Y" : "N";
+  if (PARAM_INT_KEYS.has(key)) return String(Math.round(value));
+  if (typeof value === "number") return value.toFixed(2);
+  return String(value);
+}
+
+export function normalizeParams(params, keys = null) {
+  if (!params) return params;
+  const out = { ...params };
+  const targetKeys = keys ?? Object.keys(out);
+  for (const key of targetKeys) {
+    if (out[key] == null || typeof out[key] === "boolean") continue;
+    if (typeof out[key] === "number") out[key] = roundParamValue(key, out[key]);
+  }
+  if (out.minFactor != null && out.maxFactor != null && out.minFactor >= out.maxFactor) {
+    out.maxFactor = roundParamValue("maxFactor", out.minFactor + PARAM_STEP);
+  }
+  return out;
+}
+
+function normalizeIndividual(ind) {
+  const out = {};
+  for (const [key, value] of Object.entries(ind)) {
+    out[key] = roundParamValue(key, value);
+  }
+  if (out.minFactor != null && out.maxFactor != null && out.minFactor >= out.maxFactor) {
+    out.maxFactor = roundParamValue("maxFactor", out.minFactor + PARAM_STEP);
+  }
+  return out;
+}
+
+function paramStep(key) {
+  return PARAM_INT_KEYS.has(key) ? 1 : PARAM_STEP;
+}
+
 function mean(arr) {
   return arr.length ? arr.reduce((s, v) => s + v, 0) / arr.length : 0;
 }
@@ -154,7 +207,7 @@ export function regimeParamBias(regimeLabel, baseParams) {
     b.maxFactor = clamp((b.maxFactor || 4.5) - 0.5, 2, 9);
     b.smoothLength = clamp((b.smoothLength || 5) + 2, 1, 20);
   }
-  return b;
+  return normalizeParams(b);
 }
 
 function randomInt(lo, hi) {
@@ -165,46 +218,49 @@ function roundStep(v, step) {
   return Math.round(v / step) * step;
 }
 
-function randomIndividual(bounds, seed = null) {
-  const pick = (key, intStep = 1) => {
-    const [lo, hi] = bounds[key];
-    if (seed && seed[key] != null) {
-      const jitter = (Math.random() - 0.5) * (hi - lo) * 0.3;
-      return intStep === 1
-        ? clamp(Math.round(seed[key] + jitter), lo, hi)
-        : clamp(roundStep(seed[key] + jitter, intStep), lo, hi);
-    }
-    return intStep === 1
-      ? randomInt(lo, hi)
-      : roundStep(lo + Math.random() * (hi - lo), intStep);
-  };
-
-  let minF = pick("minFactor", 0.1);
-  let maxF = pick("maxFactor", 0.1);
-  if (minF >= maxF) maxF = minF + 0.5;
-
-  return {
-    atrPeriod: pick("atrPeriod"),
-    erLength: pick("erLength"),
-    smoothLength: pick("smoothLength"),
-    minFactor: minF,
-    maxFactor: maxF,
-  };
+function pickFromBounds(bounds, key, seed = null) {
+  const spec = bounds[key];
+  if (spec === "bool") {
+    if (seed?.[key] != null) return Math.random() < 0.65 ? seed[key] : !seed[key];
+    return Math.random() < 0.5;
+  }
+  const [lo, hi] = spec;
+  const floatStep = paramStep(key);
+  if (seed?.[key] != null) {
+    const jitter = (Math.random() - 0.5) * (hi - lo) * 0.3;
+    return floatStep === 1
+      ? clamp(Math.round(seed[key] + jitter), lo, hi)
+      : clamp(roundStep(seed[key] + jitter, floatStep), lo, hi);
+  }
+  return floatStep === 1
+    ? randomInt(lo, hi)
+    : roundStep(lo + Math.random() * (hi - lo), floatStep);
 }
 
-function mutate(ind, bounds, rate = 0.2) {
+function randomIndividual(bounds, seed = null) {
+  const ind = {};
+  for (const key of Object.keys(bounds)) {
+    ind[key] = pickFromBounds(bounds, key, seed);
+  }
+  return normalizeIndividual(ind);
+}
+
+function mutate(ind, bounds, rate = 0.22) {
   const next = { ...ind };
   for (const key of Object.keys(bounds)) {
     if (Math.random() > rate) continue;
+    if (bounds[key] === "bool") {
+      next[key] = !next[key];
+      continue;
+    }
     const [lo, hi] = bounds[key];
-    const step = key.includes("Factor") ? 0.1 : 1;
+    const step = paramStep(key);
     const delta = (Math.random() - 0.5) * (hi - lo) * 0.4;
     next[key] = step === 1
       ? clamp(Math.round(next[key] + delta), lo, hi)
       : clamp(roundStep(next[key] + delta, step), lo, hi);
   }
-  if (next.minFactor >= next.maxFactor) next.maxFactor = next.minFactor + 0.5;
-  return next;
+  return normalizeIndividual(next);
 }
 
 function crossover(a, b) {
@@ -212,8 +268,7 @@ function crossover(a, b) {
   for (const key of Object.keys(a)) {
     child[key] = Math.random() < 0.5 ? a[key] : b[key];
   }
-  if (child.minFactor >= child.maxFactor) child.maxFactor = child.minFactor + 0.5;
-  return child;
+  return normalizeIndividual(child);
 }
 
 export function scoreBacktestStats(s) {
@@ -261,7 +316,7 @@ export function geneticOptimize(candles, baseParams, bounds, evaluate, config = 
       const p = { ...baseParams, ...ind };
       const r = evaluate(p);
       if (!r) continue;
-      const entry = { params: ind, ...r };
+      const entry = { params: { ...ind }, ...r };
       scored.push(entry);
       allResults.push(entry);
     }
@@ -286,14 +341,24 @@ export function geneticOptimize(candles, baseParams, bounds, evaluate, config = 
   return filterProfitableResults(allResults).sort((a, b) => b.score - a.score);
 }
 
-export function buildParamBounds(ranges) {
-  const pick = (arr) => [Math.min(...arr), Math.max(...arr)];
+export function buildParamBounds(_ranges, compact = false) {
   return {
-    atrPeriod: pick(ranges.atrPeriod),
-    erLength: pick(ranges.erLength),
-    smoothLength: pick(ranges.smoothLength),
-    minFactor: pick(ranges.minFactor),
-    maxFactor: pick(ranges.maxFactor),
+    atrPeriod: [5, 30],
+    erLength: [5, 50],
+    smoothLength: [1, 20],
+    minFactor: [0.5, 3.5],
+    maxFactor: [2, 9],
+    chopThreshold: [50, 80],
+    breakEvenPct: [0.5, 5],
+    atrMult: [1, 5],
+    mlThreshold: compact ? [0.35, 0.55] : [0.3, 0.7],
+    riskPct: compact ? [0.005, 0.015] : [0.005, 0.02],
+    useRegimeFilter: "bool",
+    useVWER: "bool",
+    useTrailingStop: "bool",
+    useBreakEven: "bool",
+    useATRSizing: "bool",
+    useMLFilter: "bool",
   };
 }
 

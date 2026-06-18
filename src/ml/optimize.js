@@ -13,7 +13,7 @@ import {
 export function runMLOptimization(candles, baseParams, ranges, runBacktestFn, options = {}) {
   const { onProgress, regimeModel = null, compact = false } = options;
 
-  const bounds = buildParamBounds(ranges);
+  const bounds = options.bounds ?? buildParamBounds(ranges, compact);
   const features = extractMarketFeatures(candles);
   const model = regimeModel ?? buildRegimeModel(candles);
   const regime = classifyRegime(features, model);
