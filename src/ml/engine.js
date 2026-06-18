@@ -291,7 +291,11 @@ export function isProfitableBacktest(stats, equityCurve = null, startEquity = nu
 }
 
 export function filterProfitableResults(results) {
-  return results.filter(r => Number.isFinite(r.netReturn) && r.netReturn > 0);
+  return results.filter(r => {
+    if (!Number.isFinite(r.netReturn) || r.netReturn <= 0) return false;
+    if (r.equityEnd != null && r.equityStart != null) return r.equityEnd > r.equityStart;
+    return true;
+  });
 }
 
 export function geneticOptimize(candles, baseParams, bounds, evaluate, config = {}) {

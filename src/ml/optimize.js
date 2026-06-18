@@ -25,6 +25,8 @@ export function runMLOptimization(candles, baseParams, ranges, runBacktestFn, op
       const s = r.stats;
       if (s.totalTrades < 2) return null;
       if (!isProfitableBacktest(s, r.equityCurve, p.startEquity ?? baseParams.startEquity ?? 10000)) return null;
+      const startEquity = p.startEquity ?? baseParams.startEquity ?? 10000;
+      const finalEquity = r.equityCurve.filter(v => !isNaN(v)).at(-1) ?? startEquity;
       return {
         netReturn: parseFloat(s.netReturn),
         sharpe: s.sharpe === "—" ? -999 : parseFloat(s.sharpe),
@@ -34,6 +36,9 @@ export function runMLOptimization(candles, baseParams, ranges, runBacktestFn, op
         winRate: parseFloat(s.winRate),
         calmar: s.calmar === "—" ? -999 : parseFloat(s.calmar),
         score: scoreBacktestStats(s),
+        equityStart: startEquity,
+        equityEnd: finalEquity,
+        equityGain: finalEquity - startEquity,
       };
     } catch {
       return null;

@@ -10,6 +10,7 @@ import {
   roundParamValue,
   normalizeParams,
   fmtParamValue,
+  isProfitableBacktest,
 } from "./ml/engine.js";
 import { runMLOptimization } from "./ml/optimize.js";
 
@@ -749,18 +750,21 @@ function runOptimization(candles, baseParams, ranges, onProgress, compact = fals
   const results = [];
   const combos = buildParamCombos(ranges, compact);
   const total = combos.length;
+  const defaultStartEquity = baseParams.startEquity || 10000;
 
   for (let done = 0; done < combos.length; done++) {
     const combo = normalizeParams(combos[done], Object.keys(ranges));
     const p = normalizeParams({ ...baseParams, ...combo });
+    const startEquity = p.startEquity || defaultStartEquity;
     try {
       const r = runBacktest(candles, p);
       const s = r.stats;
-      const netReturn = parseFloat(s.netReturn);
-      if (!Number.isFinite(netReturn) || netReturn <= 0) {
+      if (!isProfitableBacktest(s, r.equityCurve, startEquity)) {
         if (onProgress) onProgress(Math.round(((done + 1) / total) * 100));
         continue;
       }
+      const finalEquity = r.equityCurve.filter(v => !isNaN(v)).at(-1) ?? startEquity;
+      const netReturn = parseFloat(s.netReturn);
       results.push({
         params: combo,
         netReturn,
@@ -774,12 +778,16 @@ function runOptimization(candles, baseParams, ranges, onProgress, compact = fals
           + (s.sharpe === "—" ? 0 : parseFloat(s.sharpe) * 10)
           - parseFloat(s.maxDD) * 0.5
           + Math.min(s.profitFactor === "∞" ? 0 : parseFloat(s.profitFactor), 5) * 5,
+        equityStart: startEquity,
+        equityEnd: finalEquity,
+        equityGain: finalEquity - startEquity,
+        method: "grid",
       });
     } catch (_e) { /* skip invalid combo */ }
     if (onProgress) onProgress(Math.round(((done + 1) / total) * 100));
   }
 
-  return results.sort((a, b) => b.score - a.score);
+  return results.sort((a, b) => b.equityEnd - a.equityEnd || b.score - a.score);
 }
 
 function runSmartOptimization(candles, baseParams, ranges, onProgress, options = {}) {
@@ -832,31 +840,88 @@ function fullParamsKey(params) {
   return AUTO_TUNE_KEYS.map(k => `${k}:${p[k]}`).join("|");
 }
 
-function mergeProfitableParamHistory(existing, incoming) {
-  const merged = existing.map(e => ({ ...e, windows: [...(e.windows || [e.window])] }));
+function hasPositiveFinalEquity(entry) {
+  const start = entry.equityStart ?? entry.lastEquityStart;
+  const end = entry.lastEquityEnd ?? entry.equityEnd ?? entry.bestEquityEnd;
+  return start != null && end != null && end > start;
+}
+
+function mergeEquityPositiveParams(existing, incoming) {
+  const merged = existing.map(e => ({ ...e, windows: [...(e.windows || [])] }));
   for (const entry of incoming) {
-    if (!entry.confirmed) continue;
-    const idx = merged.findIndex(e => fullParamsKey(e.params) === fullParamsKey(entry.params));
+    if (!entry.params || !hasPositiveFinalEquity(entry)) continue;
+    const normalized = {
+      ...entry,
+      params: normalizeParams(entry.params, AUTO_TUNE_KEYS),
+      equityStart: entry.equityStart ?? entry.lastEquityStart,
+      equityEnd: entry.lastEquityEnd ?? entry.equityEnd,
+    };
+    normalized.equityGain = normalized.equityEnd - normalized.equityStart;
+    const idx = merged.findIndex(e => fullParamsKey(e.params) === fullParamsKey(normalized.params));
     if (idx >= 0) {
       const prev = merged[idx];
       merged[idx] = {
         ...prev,
+        ...normalized,
         hits: (prev.hits || 1) + 1,
-        lastBar: entry.bar,
-        lastBarEnd: entry.barEnd,
-        lastSegmentReturn: entry.segmentReturn,
-        lastEquityEnd: entry.equityEnd,
-        windows: [...(prev.windows || []), entry.window],
+        bestEquityEnd: Math.max(prev.bestEquityEnd ?? prev.equityEnd, normalized.equityEnd),
+        equityEnd: Math.max(prev.equityEnd, normalized.equityEnd),
+        equityGain: Math.max(prev.equityGain ?? 0, normalized.equityGain),
+        netReturn: Math.max(prev.netReturn ?? 0, normalized.netReturn ?? 0),
+        score: Math.max(prev.score ?? 0, normalized.score ?? 0),
+        windows: [...new Set([...(prev.windows || []), ...(normalized.windows || [])])],
+        sources: [...new Set([...(prev.sources || []), normalized.source].filter(Boolean))],
       };
     } else {
       merged.push({
-        ...entry,
+        ...normalized,
         hits: 1,
-        windows: [entry.window],
+        bestEquityEnd: normalized.equityEnd,
+        sources: normalized.source ? [normalized.source] : [],
       });
     }
   }
-  return merged.sort((a, b) => a.bar - b.bar);
+  return merged.sort((a, b) => (b.equityEnd ?? 0) - (a.equityEnd ?? 0));
+}
+
+function resultsToEquityEntries(results, startEquity, source = "full-search") {
+  return results
+    .filter(r => r.equityEnd != null && r.equityEnd > (r.equityStart ?? startEquity))
+    .map((r, i) => ({
+      params: normalizeParams(r.params, AUTO_TUNE_KEYS),
+      netReturn: r.netReturn,
+      score: r.score ?? 0,
+      equityStart: r.equityStart ?? startEquity,
+      equityEnd: r.equityEnd,
+      equityGain: r.equityGain ?? (r.equityEnd - (r.equityStart ?? startEquity)),
+      sharpe: r.sharpe,
+      maxDD: r.maxDD,
+      totalTrades: r.totalTrades,
+      source,
+      confirmed: true,
+      hits: 1,
+      windows: [source],
+      window: i + 1,
+      bar: 0,
+      method: r.method ?? "genetic",
+    }));
+}
+
+function runEquityPositiveParamSearch(candles, baseParams, htfAlignedDir, onProgress) {
+  const compact = candles.length > 2500;
+  const ranges = buildOptRanges(compact);
+  const { results } = runSmartOptimization(
+    candles,
+    baseParams,
+    ranges,
+    onProgress,
+    { useML: true, compact, htfAlignedDir },
+  );
+  return resultsToEquityEntries(results, baseParams.startEquity || 10000, "full-search");
+}
+
+function mergeProfitableParamHistory(existing, incoming) {
+  return mergeEquityPositiveParams(existing, incoming);
 }
 
 function buildTuneEntry(fields) {
@@ -868,7 +933,7 @@ function buildTuneEntry(fields) {
 function tuneHistoryToOptResults(history) {
   return history.map((t, i) => ({
     params: normalizeParams(t.params, AUTO_TUNE_KEYS),
-    netReturn: t.lastSegmentReturn ?? t.segmentReturn ?? t.trainNetReturn ?? 0,
+    netReturn: t.netReturn ?? t.lastSegmentReturn ?? t.segmentReturn ?? t.trainNetReturn ?? 0,
     trainNetReturn: t.trainNetReturn ?? 0,
     segmentReturn: t.lastSegmentReturn ?? t.segmentReturn ?? 0,
     sharpe: t.sharpe ?? 0,
@@ -882,8 +947,12 @@ function tuneHistoryToOptResults(history) {
     bar: t.lastBar ?? t.bar,
     hits: t.hits ?? 1,
     windows: t.windows ?? [t.window],
-    equityEnd: t.lastEquityEnd ?? t.equityEnd,
-  }));
+    equityStart: t.equityStart ?? t.lastEquityStart,
+    equityEnd: t.bestEquityEnd ?? t.lastEquityEnd ?? t.equityEnd,
+    equityGain: t.equityGain ?? ((t.bestEquityEnd ?? t.lastEquityEnd ?? t.equityEnd ?? 0) - (t.equityStart ?? 0)),
+    source: t.source ?? t.sources?.[0] ?? "adaptive",
+    method: t.method,
+  })).sort((a, b) => (b.equityEnd ?? 0) - (a.equityEnd ?? 0));
 }
 
 function buildOptRanges(compact = false) {
@@ -1113,6 +1182,7 @@ function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedD
         regime: best.regime,
         method: useML ? "genetic" : "grid",
         confirmed: true,
+        source: "adaptive",
         windows: [1],
       });
       tuneLog.push(entry);
@@ -1217,6 +1287,7 @@ function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedD
         regime: best.regime,
         method: useML ? "genetic" : "grid",
         confirmed: true,
+        source: "adaptive",
         windows: [windowNum],
       });
       tuneLog.push(entry);
@@ -2371,8 +2442,17 @@ export default function App() {
 
         if (cancelled) return;
 
-        const confirmed = (r.profitableParamHistory || []).filter(e => e.confirmed);
-        const mergedHistory = mergeProfitableParamHistory(profitableParamsRef.current, confirmed);
+        const adaptiveEntries = (r.profitableParamHistory || []).filter(e => e.confirmed);
+        let mergedHistory = mergeEquityPositiveParams(profitableParamsRef.current, adaptiveEntries);
+
+        const searchEntries = runEquityPositiveParamSearch(
+          candles,
+          paramsRef.current,
+          htfAligned,
+          p => { if (!cancelled) setTuneProgress(Math.min(99, 50 + Math.round(p * 0.5))); },
+        );
+        if (cancelled) return;
+        mergedHistory = mergeEquityPositiveParams(mergedHistory, searchEntries);
         profitableParamsRef.current = mergedHistory;
 
         setResult(r);
@@ -2402,6 +2482,50 @@ export default function App() {
       clearTimeout(timer);
     };
   }, [candles, adaptiveSettingsKey, htfResult, htfMultiplier, htfCandles, autoTune, retuneToken]);
+
+  // ── Full parameter search (positive final equity) when auto-tune is off ──
+  useEffect(() => {
+    if (!candles.length || autoTune) return;
+
+    let cancelled = false;
+    setOptRunning(true);
+    setOptProgress(0);
+    setError("");
+
+    const timer = setTimeout(() => {
+      try {
+        let htfAligned = null;
+        if (htfResult && htfMultiplier > 0) {
+          htfAligned = alignHTFDir(candles, htfCandles, htfResult.dir);
+        }
+
+        const entries = runEquityPositiveParamSearch(
+          candles,
+          paramsRef.current,
+          htfAligned,
+          p => { if (!cancelled) setOptProgress(p); },
+        );
+        if (cancelled) return;
+
+        const merged = mergeEquityPositiveParams(profitableParamsRef.current, entries);
+        profitableParamsRef.current = merged;
+        setProfitableParams(merged);
+        setOptResults(merged.length ? tuneHistoryToOptResults(merged) : null);
+      } catch (e) {
+        if (!cancelled) {
+          console.error("Param search error:", e);
+          setError("Parameter search failed: " + e.message);
+        }
+      } finally {
+        if (!cancelled) setOptRunning(false);
+      }
+    }, 100);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [candles, adaptiveSettingsKey, htfResult, htfMultiplier, htfCandles, autoTune]);
 
   // Reset view range
   useEffect(() => {
@@ -2468,21 +2592,30 @@ export default function App() {
   // ── Run optimization ──
   const runOpt = useCallback(async () => {
     if (!candles.length) return;
-    setOptRunning(true); setOptProgress(0); setOptResults(null);
-    const ranges = buildOptRanges(candles.length > 2500);
+    setOptRunning(true);
+    setOptProgress(0);
     setTimeout(() => {
       try {
-        const results = runSmartOptimization(
-          candles, params, ranges, p => setOptProgress(p),
-          { useML: true, compact: candles.length > 2500, htfAlignedDir: null },
-        ).results;
-        setOptResults(results.slice(0, 20));
+        let htfAligned = null;
+        if (htfResult && htfMultiplier > 0) {
+          htfAligned = alignHTFDir(candles, htfCandles, htfResult.dir);
+        }
+        const entries = runEquityPositiveParamSearch(
+          candles,
+          params,
+          htfAligned,
+          p => setOptProgress(p),
+        );
+        const merged = mergeEquityPositiveParams(profitableParamsRef.current, entries);
+        profitableParamsRef.current = merged;
+        setProfitableParams(merged);
+        setOptResults(merged.length ? tuneHistoryToOptResults(merged) : null);
       } catch (e) {
         setError("Optimization failed: " + e.message);
       }
       setOptRunning(false);
     }, 50);
-  }, [candles, params]);
+  }, [candles, params, htfResult, htfMultiplier, htfCandles]);
 
   // ── Run Monte Carlo ──
   const runMC = useCallback(() => {
@@ -2605,7 +2738,7 @@ export default function App() {
                 </>
               )}
               {profitableParams.length > 0 && (
-                <StatRow label="Profitable sets" value={profitableParams.length} color={C.accent} mono />
+                <StatRow label="Equity+ sets" value={profitableParams.length} color={C.accent} mono />
               )}
               {tuneLog?.length > 0 && (
                 <StatRow label="Tune windows" value={tuneLog.length} color={C.purple} mono />
@@ -2804,12 +2937,14 @@ export default function App() {
                     <div style={{ padding: "12px 14px" }}>
                       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
                         <span style={{ fontSize: 11, color: C.label }}>
-                          {autoTune
-                            ? `Captured profitable params (${profitableParams.length} unique, ${tuneLog?.length ?? 0} windows)`
-                            : "Parameter Optimization (minF x maxF heatmap)"}
+                          {optRunning
+                            ? `Searching params… ${optProgress}%`
+                            : autoTune
+                              ? `Positive final equity (${profitableParams.length} unique, ${tuneLog?.length ?? 0} adaptive windows)`
+                              : `Positive final equity (${profitableParams.length} tracked sets)`}
                         </span>
-                        <button onClick={runOpt} disabled={optRunning} style={{ padding: "5px 14px", borderRadius: 6, border: `1px solid ${optRunning ? C.border : C.accent}66`, background: optRunning ? C.border : C.accent + "22", color: optRunning ? C.sub : C.accent, fontSize: 11, cursor: optRunning ? "wait" : "pointer" }}>
-                          {optRunning ? `Running ${optProgress}%...` : "Run Optimization"}
+                        <button onClick={runOpt} disabled={optRunning || tuning} style={{ padding: "5px 14px", borderRadius: 6, border: `1px solid ${optRunning || tuning ? C.border : C.accent}66`, background: optRunning || tuning ? C.border : C.accent + "22", color: optRunning || tuning ? C.sub : C.accent, fontSize: 11, cursor: optRunning || tuning ? "wait" : "pointer" }}>
+                          {optRunning ? `Searching ${optProgress}%…` : "Re-Search Params"}
                         </button>
                       </div>
                       {optResults && (
@@ -2821,38 +2956,42 @@ export default function App() {
                             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 9 }}>
                               <thead>
                                 <tr style={{ borderBottom: `1px solid ${C.border}` }}>
-                                  <th style={{ padding: "4px 6px", color: C.sub, textAlign: "left" }}>Win</th>
-                                  <th style={{ padding: "4px 6px", color: C.sub, textAlign: "left" }}>Bar</th>
+                                  <th style={{ padding: "4px 6px", color: C.sub, textAlign: "left" }}>#</th>
+                                  <th style={{ padding: "4px 6px", color: C.sub, textAlign: "left" }}>Src</th>
                                   <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>ATR</th>
                                   <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>ER</th>
                                   <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>Sm</th>
                                   <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>minF</th>
                                   <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>maxF</th>
-                                  <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>Seg%</th>
+                                  <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>Net%</th>
+                                  <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>Start</th>
+                                  <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>Final</th>
+                                  <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>Gain</th>
                                   <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>Hits</th>
-                                  <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>Equity</th>
                                 </tr>
                               </thead>
                               <tbody>
                                 {optResults.map((r, i) => (
                                   <tr key={i} style={{ borderBottom: `1px solid ${C.border}11`, background: i === 0 ? C.accent + "11" : "transparent", cursor: "pointer" }}
                                     onClick={() => { setParams(p => normalizeParams({ ...p, ...r.params })); }}>
-                                    <td style={{ padding: "4px 6px", color: C.sub, fontFamily: "monospace" }}>#{r.window ?? i + 1}</td>
-                                    <td style={{ padding: "4px 6px", color: C.label, fontFamily: "monospace", fontSize: 8 }}>{r.bar ?? "—"}</td>
+                                    <td style={{ padding: "4px 6px", color: C.sub, fontFamily: "monospace" }}>{i + 1}</td>
+                                    <td style={{ padding: "4px 6px", color: C.label, fontFamily: "monospace", fontSize: 8 }}>{r.source ?? "—"}</td>
                                     <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.label }}>{fmtParamValue("atrPeriod", r.params.atrPeriod)}</td>
                                     <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.label }}>{fmtParamValue("erLength", r.params.erLength)}</td>
                                     <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.label }}>{fmtParamValue("smoothLength", r.params.smoothLength)}</td>
                                     <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.accent }}>{fmtParamValue("minFactor", r.params.minFactor)}</td>
                                     <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.red }}>{fmtParamValue("maxFactor", r.params.maxFactor)}</td>
-                                    <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", fontWeight: 700, color: r.netReturn >= 0 ? C.accent : C.red }}>{r.netReturn.toFixed(1)}%</td>
+                                    <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", fontWeight: 700, color: r.netReturn >= 0 ? C.accent : C.red }}>{r.netReturn.toFixed(2)}%</td>
+                                    <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.sub, fontSize: 8 }}>${Math.round(r.equityStart ?? 0)}</td>
+                                    <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.accent, fontSize: 8 }}>${Math.round(r.equityEnd ?? 0)}</td>
+                                    <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", fontWeight: 700, color: (r.equityGain ?? 0) >= 0 ? C.accent : C.red, fontSize: 8 }}>{(r.equityGain ?? 0) >= 0 ? "+" : ""}${Math.round(r.equityGain ?? 0)}</td>
                                     <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.purple }}>{r.hits ?? 1}</td>
-                                    <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.sub, fontSize: 8 }}>{r.equityEnd ? `$${Math.round(r.equityEnd)}` : "—"}</td>
                                   </tr>
                                 ))}
                               </tbody>
                             </table>
                             <div style={{ marginTop: 6, fontSize: 9, color: C.sub }}>
-                              {autoTune ? "All profitable retune windows — persists across Re-tune. Click row to apply." : "Click any row to apply parameters"}
+                              Only sets with final equity &gt; start equity are kept. Sorted by final equity. Click row to apply.
                             </div>
                           </div>
                         </>
