@@ -1,4 +1,18 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
+import {
+  buildRegimeModel,
+  buildSignalFeatures,
+  buildTradeTrainingSet,
+  classifyRegime,
+  extractMarketFeatures,
+  predictLogistic,
+  trainLogisticRegression,
+} from "./ml/engine.js";
+import {
+  runMLOptimization,
+  isProfitableBacktest,
+  filterProfitableResults,
+} from "./ml/optimize.js";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ADAPTIVE SUPERTRIND PRO v2.1 — Continued Enhancements
@@ -11,7 +25,8 @@ import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 //    • Chart crosshair with OHLC/tooltip readout
 //    • Drawdown distribution histogram
 //    • ATR-based position sizing option
-//    • Session/hour filtering
+//    • Runtime auto-tune with ML (genetic search + k-means regime clustering)
+//    • Logistic regression signal-quality filter
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // ─── Palette ──────────────────────────────────────────────────────────────────
@@ -300,7 +315,8 @@ function alignHTFDir(currentCandles, htfCandles, htfDir) {
 //  ENHANCED BACKTEST ENGINE — with trailing stop, break-even, session filter
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function runBacktest(candles, p, htfAlignedDir = null) {
+function runBacktest(candles, p, htfAlignedDir = null, options = {}) {
+  const { initialEquity = null, evalStartIdx = 0 } = options;
   const n = candles.length;
 
   // ── Technical Indicators ──
@@ -323,7 +339,7 @@ function runBacktest(candles, p, htfAlignedDir = null) {
   }
 
   // ── Backtest ──
-  const startEquity = p.startEquity || 10000;
+  const startEquity = initialEquity ?? p.startEquity ?? 10000;
   const riskPct = p.riskPct || 0.01;
   let equity = startEquity;
   const equityCurve = new Array(n).fill(NaN);
@@ -342,6 +358,11 @@ function runBacktest(candles, p, htfAlignedDir = null) {
   const EXIT_BREAKEVEN = "be";
 
   for (let i = 1; i < n; i++) {
+    if (i < evalStartIdx) {
+      equityCurve[i] = equity;
+      continue;
+    }
+
     const sig = sigMap[i];
 
     // ── Update trailing state if in position ──
@@ -454,10 +475,14 @@ function runBacktest(candles, p, htfAlignedDir = null) {
 
       // Multi-timeframe confluence
       if (htfAlignedDir && htfAlignedDir[i] !== 0) {
-        // Only take longs when HTF is bullish, shorts when HTF is bearish
         const htfDir = htfAlignedDir[i];
         if (sig.type === "long" && htfDir === -1) { equityCurve[i] = equity; continue; }
         if (sig.type === "short" && htfDir === 1) { equityCurve[i] = equity; continue; }
+      }
+
+      if (p.useMLFilter && p.mlModel) {
+        const mlProb = predictLogistic(p.mlModel, buildSignalFeatures(candles, i, dir, er, ci));
+        if (mlProb < (p.mlThreshold ?? 0.42)) { equityCurve[i] = equity; continue; }
       }
 
       inPos = sig.type === "long" ? 1 : -1;
@@ -619,7 +644,9 @@ function runWalkForward(candles, baseParams, optRanges, wfConfig) {
     const testCandles = candles.slice(cursor + trainSize, cursor + trainSize + testSize);
 
     // Optimize on training set (limited grid for speed)
-    const trainResults = runOptimization(trainCandles, baseParams, optRanges);
+    const trainResults = runSmartOptimization(
+      trainCandles, baseParams, optRanges, null, { useML: true, compact: true },
+    ).results;
     if (!trainResults.length) { cursor += testSize; continue; }
 
     const bestParams = { ...baseParams, ...trainResults[0].params };
@@ -745,6 +772,11 @@ function runOptimization(candles, baseParams, ranges, onProgress) {
     try {
       const r = runBacktest(candles, p);
       const s = r.stats;
+      if (!isProfitableBacktest(s, r.equityCurve, p.startEquity ?? baseParams.startEquity ?? 10000)) {
+        done++;
+        if (onProgress) onProgress(Math.round((done / total) * 100));
+        continue;
+      }
       results.push({
         params: combo,
         netReturn: parseFloat(s.netReturn),
@@ -765,6 +797,309 @@ function runOptimization(candles, baseParams, ranges, onProgress) {
   }
 
   return results.sort((a, b) => b.score - a.score);
+}
+
+function runSmartOptimization(candles, baseParams, ranges, onProgress, options = {}) {
+  const {
+    useML = true,
+    regimeModel = null,
+    compact = false,
+    htfAlignedDir = null,
+  } = options;
+
+  if (useML) {
+    const ml = runMLOptimization(
+      candles,
+      baseParams,
+      ranges,
+      p => runBacktest(candles, p, htfAlignedDir),
+      { onProgress, regimeModel, compact },
+    );
+    return { results: ml.results, mlMeta: ml };
+  }
+
+  return {
+    results: filterProfitableResults(runOptimization(candles, baseParams, ranges, onProgress)),
+    mlMeta: null,
+  };
+}
+
+function attachMLSignalFilter(trainCandles, segParams, htfAlignedDir) {
+  if (!segParams.useMLFilter) return segParams;
+  const probe = runBacktest(trainCandles, { ...segParams, useMLFilter: false }, htfAlignedDir);
+  const samples = buildTradeTrainingSet(probe.trades, trainCandles, probe.er, probe.ci, probe.dir);
+  const mlModel = trainLogisticRegression(samples);
+  if (!mlModel || samples.length < 8) return segParams;
+  return { ...segParams, mlModel };
+}
+
+const ADAPTIVE_CORE_KEYS = ["atrPeriod", "erLength", "smoothLength", "minFactor", "maxFactor"];
+
+function buildOptRanges(compact = false) {
+  if (compact) {
+    return {
+      atrPeriod: [8, 10, 14],
+      erLength: [10, 14, 20],
+      smoothLength: [3, 5, 8],
+      minFactor: [1.0, 1.5, 2.0, 2.5],
+      maxFactor: [3.0, 4.0, 5.0, 6.0],
+    };
+  }
+  return {
+    atrPeriod: [7, 10, 14, 18, 21],
+    erLength: [8, 14, 20, 28],
+    smoothLength: [3, 5, 8, 13],
+    minFactor: [1.0, 1.5, 2.0, 2.5],
+    maxFactor: [3.0, 4.0, 5.0, 6.0, 7.0],
+  };
+}
+
+function getAdaptiveConfig(candleCount) {
+  const lookback = Math.min(Math.max(200, Math.floor(candleCount * 0.25)), 2000);
+  const retuneEvery = Math.min(Math.max(100, Math.floor(candleCount * 0.1)), 500);
+  return { lookback, retuneEvery };
+}
+
+function assembleBacktestResult(candles, p, indicators, trades, equityCurve, drawdowns, startEquity) {
+  const { atr, er, smoothF, stLine, dir, ci } = indicators;
+  const n = candles.length;
+  const equity = equityCurve[n - 1] ?? equityCurve.filter(v => !isNaN(v)).at(-1) ?? startEquity;
+
+  const sigEvents = [];
+  for (let i = 1; i < n; i++) {
+    if (dir[i] !== dir[i - 1]) {
+      sigEvents.push({ i, type: dir[i] === 1 ? "long" : "short", bar: candles[i] });
+    }
+  }
+  const qualitySignals = computeSignalQuality(candles, dir, sigEvents);
+
+  const wins = trades.filter(t => t.win);
+  const losses = trades.filter(t => !t.win);
+  const grossWin = wins.reduce((s, t) => s + (+t.netPnlPct), 0);
+  const grossLoss = Math.abs(losses.reduce((s, t) => s + (+t.netPnlPct), 0));
+  const pf = grossLoss > 0 ? (grossWin / grossLoss).toFixed(2) : "∞";
+  const avgWin = wins.length ? (grossWin / wins.length).toFixed(2) : "0";
+  const avgLoss = losses.length ? (grossLoss / losses.length).toFixed(2) : "0";
+
+  const returns = [];
+  for (let i = 1; i < equityCurve.length; i++) {
+    if (!isNaN(equityCurve[i]) && !isNaN(equityCurve[i - 1]) && equityCurve[i - 1] > 0) {
+      returns.push((equityCurve[i] - equityCurve[i - 1]) / equityCurve[i - 1]);
+    }
+  }
+  const meanR = returns.reduce((s, r) => s + r, 0) / (returns.length || 1);
+  const stdR = Math.sqrt(returns.reduce((s, r) => s + (r - meanR) ** 2, 0) / (returns.length || 1));
+  const sharpe = stdR > 0 ? ((meanR / stdR) * Math.sqrt(252)).toFixed(2) : "—";
+
+  const downsideRets = returns.filter(r => r < 0);
+  const downsideDev = downsideRets.length > 0
+    ? Math.sqrt(downsideRets.reduce((s, r) => s + r * r, 0) / downsideRets.length)
+    : 0;
+  const sortino = downsideDev > 0 ? ((meanR / downsideDev) * Math.sqrt(252)).toFixed(2) : "—";
+
+  let peak = startEquity, maxDD = 0, maxDDD = 0, ddStart = 0;
+  for (let i = 0; i < equityCurve.length; i++) {
+    const v = equityCurve[i];
+    if (isNaN(v)) continue;
+    if (v > peak) { peak = v; ddStart = i; }
+    const dd = (peak - v) / peak;
+    if (dd > maxDD) { maxDD = dd; maxDDD = i - ddStart; }
+  }
+
+  const flipExits = trades.filter(t => t.exitReason === "flip").length;
+  const trailExits = trades.filter(t => t.exitReason === "trail").length;
+  const beExits = trades.filter(t => t.exitReason === "be").length;
+
+  const ddDistribution = computeDDDistribution(equityCurve);
+  const totalBars = equityCurve.filter(v => !isNaN(v)).length;
+  const barsPerYear = p.barsPerYear || 365 * 24;
+  const years = totalBars / barsPerYear;
+  const annReturn = years > 0 ? ((equity / startEquity) ** (1 / years) - 1) * 100 : 0;
+  const calmar = maxDD > 0 ? (annReturn / (maxDD * 100)).toFixed(2) : "—";
+  const netProfit = equity - startEquity;
+  const recoveryFactor = maxDD > 0 ? (netProfit / (maxDD * startEquity)).toFixed(2) : "—";
+
+  const W = trades.length ? wins.length / trades.length : 0;
+  const avgWinFrac = wins.length ? grossWin / wins.length / 100 : 0;
+  const avgLossFrac = losses.length ? grossLoss / losses.length / 100 : 0;
+  const kelly = (avgLossFrac > 0 && W > 0)
+    ? ((W - ((1 - W) / (avgWinFrac / avgLossFrac))) * 100).toFixed(1)
+    : "—";
+
+  let maxCW = 0, maxCL = 0, cw = 0, cl = 0;
+  for (const t of trades) {
+    if (t.win) { cw++; cl = 0; maxCW = Math.max(maxCW, cw); }
+    else { cl++; cw = 0; maxCL = Math.max(maxCL, cl); }
+  }
+
+  const monthlyRets = computeMonthlyReturns(trades, startEquity);
+  const longs = trades.filter(t => t.dir === "Long");
+  const shorts = trades.filter(t => t.dir === "Short");
+  const netReturn = ((equity / startEquity - 1) * 100).toFixed(2);
+
+  return {
+    atr, er, smoothF, stLine, dir, signals: qualitySignals, equityCurve, trades,
+    ci, monthlyRets, drawdowns: drawdowns.length > 0 ? drawdowns : [{ idx: 0, dd: 0, duration: 0 }],
+    ddDistribution,
+    stats: {
+      netReturn, annReturn: annReturn.toFixed(2),
+      winRate: trades.length ? ((wins.length / trades.length) * 100).toFixed(1) : "—",
+      totalTrades: trades.length,
+      longs: longs.length, shorts: shorts.length,
+      longWinRate: longs.length ? ((longs.filter(t => t.win).length / longs.length) * 100).toFixed(1) : "—",
+      shortWinRate: shorts.length ? ((shorts.filter(t => t.win).length / shorts.length) * 100).toFixed(1) : "—",
+      profitFactor: pf, avgWin, avgLoss,
+      maxDD: (maxDD * 100).toFixed(2), maxDDD,
+      sharpe, sortino, calmar, recoveryFactor, kelly,
+      maxCW, maxCL,
+      bestTrade: trades.length ? Math.max(...trades.map(t => +t.netPnlPct)).toFixed(2) : "—",
+      worstTrade: trades.length ? Math.min(...trades.map(t => +t.netPnlPct)).toFixed(2) : "—",
+      avgQuality: "—",
+      flipExits, trailExits, beExits,
+    },
+  };
+}
+
+function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedDir = null, onProgress, options = {}) {
+  const { useML = true, regimeModel: initialRegimeModel = null } = options;
+  const { lookback, retuneEvery } = config;
+  const n = candles.length;
+  const startEquity = baseParams.startEquity || 10000;
+  const compact = n > 2500;
+  const regimeModel = initialRegimeModel ?? buildRegimeModel(candles);
+  let mlMeta = null;
+
+  if (n < lookback + 50) {
+    const { results, mlMeta: meta } = runSmartOptimization(
+      candles, baseParams, optRanges, onProgress,
+      { useML, regimeModel, compact, htfAlignedDir },
+    );
+    mlMeta = meta;
+    const best = results[0];
+    const bestParams = best ? { ...baseParams, ...best.params } : baseParams;
+    const filtered = best ? attachMLSignalFilter(candles, bestParams, htfAlignedDir) : bestParams;
+    const result = runBacktest(candles, filtered, htfAlignedDir);
+    return {
+      ...result,
+      adaptive: true,
+      mlPowered: useML,
+      mlMeta,
+      tunedParams: best?.params ?? null,
+      tuneLog: best ? [{
+        bar: 0,
+        params: { ...best.params },
+        score: best.score,
+        netReturn: best.netReturn,
+        regime: best.regime,
+        method: useML ? "genetic" : "grid",
+      }] : [],
+      adaptiveConfig: config,
+      regimeModel,
+    };
+  }
+
+  const mergedEquity = new Array(n).fill(NaN);
+  const mergedStLine = new Array(n).fill(NaN);
+  const mergedDir = new Array(n).fill(1);
+  const mergedEr = new Array(n).fill(0);
+  const mergedSmoothF = new Array(n).fill(NaN);
+  const mergedAtr = new Array(n).fill(NaN);
+  const mergedCi = baseParams.useRegimeFilter ? new Array(n).fill(NaN) : null;
+  const allTrades = [];
+  const allDrawdowns = [];
+  const tuneLog = [];
+  let equity = startEquity;
+  let cursor = 0;
+  let lastGoodParams = baseParams;
+  const totalSteps = Math.max(1, Math.ceil((n - lookback) / retuneEvery) + 1);
+  let step = 0;
+
+  while (cursor < n) {
+    const segStart = cursor;
+    const segEnd = cursor === 0 ? Math.min(lookback, n) : Math.min(cursor + retuneEvery, n);
+    if (segStart >= n || segEnd <= segStart) break;
+
+    const trainEnd = segStart === 0 ? segEnd : segStart;
+    const trainStart = Math.max(0, trainEnd - lookback);
+    const trainCandles = candles.slice(trainStart, trainEnd);
+
+    let segParams = lastGoodParams;
+    if (trainCandles.length >= 50) {
+      const { results, mlMeta: meta } = runSmartOptimization(
+        trainCandles, baseParams, optRanges,
+        p => { if (onProgress) onProgress(Math.round((step / totalSteps) * 50 + p * 0.5)); },
+        { useML, regimeModel, compact, htfAlignedDir: null },
+      );
+      if (meta && !mlMeta) mlMeta = meta;
+      const best = results[0];
+      if (best) {
+        lastGoodParams = { ...baseParams, ...best.params };
+        segParams = attachMLSignalFilter(trainCandles, lastGoodParams, null);
+        tuneLog.push({
+          bar: segStart,
+          params: { ...best.params },
+          score: best.score,
+          netReturn: best.netReturn,
+          regime: best.regime ?? meta?.regime?.label,
+          method: useML ? "genetic" : "grid",
+        });
+      }
+    }
+
+    const warmup = Math.max(0, segStart - lookback);
+    const slice = candles.slice(warmup, segEnd);
+    const evalStartIdx = segStart - warmup;
+    const htfSlice = htfAlignedDir ? htfAlignedDir.slice(warmup, segEnd) : null;
+
+    const seg = runBacktest(slice, segParams, htfSlice, { initialEquity: equity, evalStartIdx });
+
+    for (let i = segStart; i < segEnd; i++) {
+      const j = i - warmup;
+      mergedEquity[i] = seg.equityCurve[j];
+      mergedStLine[i] = seg.stLine[j];
+      mergedDir[i] = seg.dir[j];
+      mergedEr[i] = seg.er[j];
+      mergedSmoothF[i] = seg.smoothF[j];
+      mergedAtr[i] = seg.atr[j];
+      if (mergedCi && seg.ci) mergedCi[i] = seg.ci[j];
+    }
+
+    for (const t of seg.trades) {
+      allTrades.push({ ...t, n: allTrades.length + 1 });
+    }
+    allDrawdowns.push(...seg.drawdowns);
+
+    equity = seg.equityCurve[slice.length - 1] ?? equity;
+    cursor = segEnd;
+    step++;
+    if (onProgress) onProgress(Math.round((step / totalSteps) * 100));
+  }
+
+  for (let i = 0; i < n; i++) {
+    if (isNaN(mergedEquity[i])) mergedEquity[i] = i > 0 ? mergedEquity[i - 1] : startEquity;
+  }
+
+  const latestParams = tuneLog.length ? tuneLog[tuneLog.length - 1].params : null;
+  const result = assembleBacktestResult(
+    candles,
+    latestParams ? { ...baseParams, ...latestParams } : baseParams,
+    { atr: mergedAtr, er: mergedEr, smoothF: mergedSmoothF, stLine: mergedStLine, dir: mergedDir, ci: mergedCi },
+    allTrades,
+    mergedEquity,
+    allDrawdowns,
+    startEquity,
+  );
+
+  return {
+    ...result,
+    adaptive: true,
+    mlPowered: useML,
+    mlMeta,
+    tunedParams: latestParams,
+    tuneLog,
+    adaptiveConfig: config,
+    regimeModel,
+  };
 }
 
 // ─── Formatting helpers ───────────────────────────────────────────────────────
@@ -1423,16 +1758,16 @@ function Pill({ children, active, onClick, color }) {
   );
 }
 
-function Slider({ label, value, min, max, step, onChange, color, unit }) {
+function Slider({ label, value, min, max, step, onChange, color, unit, disabled }) {
   return (
-    <div style={{ marginBottom: 12 }}>
+    <div style={{ marginBottom: 12, opacity: disabled ? 0.55 : 1 }}>
       <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
         <span style={{ fontSize: 10, color: C.label }}>{label}</span>
         <span style={{ fontSize: 10, fontFamily: "monospace", color: color || C.accent }}>{value}{unit || ""}</span>
       </div>
-      <input type="range" min={min} max={max} step={step} value={value}
+      <input type="range" min={min} max={max} step={step} value={value} disabled={disabled}
         onChange={e => onChange(+e.target.value)}
-        style={{ width: "100%", accentColor: color || C.accent, cursor: "pointer" }} />
+        style={{ width: "100%", accentColor: color || C.accent, cursor: disabled ? "not-allowed" : "pointer" }} />
     </div>
   );
 }
@@ -1785,6 +2120,13 @@ export default function App() {
   const [wfResults, setWfResults] = useState(null);
   const [wfRunning, setWfRunning] = useState(false);
 
+  const [autoTune, setAutoTune] = useState(true);
+  const [useML, setUseML] = useState(true);
+  const [tuning, setTuning] = useState(false);
+  const [tuneProgress, setTuneProgress] = useState(0);
+  const [tuneLog, setTuneLog] = useState(null);
+  const [retuneToken, setRetuneToken] = useState(0);
+
   const [params, setParams] = useState({
     atrPeriod: 10, erLength: 14, smoothLength: 5,
     minFactor: 1.5, maxFactor: 4.5,
@@ -1800,7 +2142,30 @@ export default function App() {
     atrMult: 2,
     sessionFilter: false,
     sessionHours: [0, 24],
+    useMLFilter: true,
+    mlThreshold: 0.42,
   });
+
+  const paramsRef = useRef(params);
+  paramsRef.current = params;
+
+  const adaptiveSettingsKey = useMemo(() => JSON.stringify({
+    useRegimeFilter: params.useRegimeFilter,
+    useVWER: params.useVWER,
+    useTrailingStop: params.useTrailingStop,
+    useBreakEven: params.useBreakEven,
+    breakEvenPct: params.breakEvenPct,
+    useATRSizing: params.useATRSizing,
+    atrMult: params.atrMult,
+    sessionFilter: params.sessionFilter,
+    chopThreshold: params.chopThreshold,
+    riskPct: params.riskPct,
+    startEquity: params.startEquity,
+    minStopPct: params.minStopPct,
+    barsPerYear: params.barsPerYear,
+    useMLFilter: params.useMLFilter,
+    mlThreshold: params.mlThreshold,
+  }), [params]);
 
   const [viewRange, setViewRange] = useState([0, 0]);
   const containerRef = useRef(null);
@@ -1812,9 +2177,9 @@ export default function App() {
     return () => obs.disconnect();
   }, []);
 
-  // ── Main backtest effect ──
+  // ── Manual backtest (auto-tune off) ──
   useEffect(() => {
-    if (!candles.length) return;
+    if (!candles.length || autoTune) return;
     try {
       let htfAligned = null;
       if (htfResult && htfMultiplier > 0) {
@@ -1826,7 +2191,73 @@ export default function App() {
       console.error("Backtest error:", e);
       setError("Backtest failed: " + e.message);
     }
-  }, [candles, params, htfResult, htfMultiplier]);
+  }, [candles, params, htfResult, htfMultiplier, htfCandles, autoTune]);
+
+  // ── Adaptive auto-tune backtest (runtime rolling optimization) ──
+  useEffect(() => {
+    if (!candles.length || !autoTune) return;
+
+    let cancelled = false;
+    setTuning(true);
+    setTuneProgress(0);
+    setError("");
+
+    const timer = setTimeout(() => {
+      try {
+        let htfAligned = null;
+        if (htfResult && htfMultiplier > 0) {
+          htfAligned = alignHTFDir(candles, htfCandles, htfResult.dir);
+        }
+
+        const config = getAdaptiveConfig(candles.length);
+        const ranges = buildOptRanges(candles.length > 2500);
+        const r = runAdaptiveBacktest(
+          candles,
+          paramsRef.current,
+          ranges,
+          config,
+          htfAligned,
+          p => { if (!cancelled) setTuneProgress(p); },
+          { useML },
+        );
+
+        if (cancelled) return;
+
+        setResult(r);
+        setTuneLog(r.tuneLog);
+        setOptResults(r.tuneLog?.length ? [{
+          params: r.tunedParams,
+          netReturn: parseFloat(r.stats.netReturn),
+          sharpe: r.stats.sharpe === "—" ? -999 : parseFloat(r.stats.sharpe),
+          maxDD: parseFloat(r.stats.maxDD),
+          profitFactor: r.stats.profitFactor === "∞" ? 999 : parseFloat(r.stats.profitFactor),
+          totalTrades: r.stats.totalTrades,
+          winRate: parseFloat(r.stats.winRate),
+          calmar: r.stats.calmar === "—" ? -999 : parseFloat(r.stats.calmar),
+          score: r.tuneLog?.at(-1)?.score ?? 0,
+        }] : null);
+
+        if (r.tunedParams) {
+          setParams(p => {
+            const next = { ...p, ...r.tunedParams };
+            return ADAPTIVE_CORE_KEYS.some(k => p[k] !== next[k]) ? next : p;
+          });
+        }
+      } catch (e) {
+        if (!cancelled) {
+          console.error("Adaptive tune error:", e);
+          setError("Auto-tune failed: " + e.message);
+        }
+      } finally {
+        if (!cancelled) setTuning(false);
+      }
+    }, 30);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [candles, adaptiveSettingsKey, htfResult, htfMultiplier, htfCandles, autoTune, retuneToken, useML]);
 
   // Reset view range
   useEffect(() => {
@@ -1840,7 +2271,11 @@ export default function App() {
   const fetch = useCallback(async () => {
     setLoading(true); setError(""); setProgress(0);
     setCandles([]); setResult(null); setOptResults(null); setMcResults(null); setWfResults(null);
-    setHtfCandles(null); setHtfResult(null);
+    setHtfCandles(null); setHtfResult(null); setTuneLog(null);
+
+    const intervalMs = INTERVALS.find(i => i.label === interval)?.ms ?? 3600e3;
+    const barsPerYear = Math.max(1, Math.round((365.25 * 86400e3) / intervalMs));
+    setParams(p => ({ ...p, barsPerYear }));
 
     try {
       const startMs = fromISO(startDate);
@@ -1859,11 +2294,11 @@ export default function App() {
         try {
           const htfData = await fetchKlines(symbol, htfLabel, startMs, endMs);
           setHtfCandles(htfData);
-          // Compute ST on HTF
-          const htfAtr = atrRMA(htfData, params.atrPeriod);
-          const htfEr = params.useVWER ? volumeWeightedER(htfData, params.erLength) : kaufmanER(htfData, params.erLength);
-          const htfRawF = htfEr.map(e => params.maxFactor - e * (params.maxFactor - params.minFactor));
-          const htfSmoothF = ema(htfRawF, params.smoothLength);
+          const p = paramsRef.current;
+          const htfAtr = atrRMA(htfData, p.atrPeriod);
+          const htfEr = p.useVWER ? volumeWeightedER(htfData, p.erLength) : kaufmanER(htfData, p.erLength);
+          const htfRawF = htfEr.map(e => p.maxFactor - e * (p.maxFactor - p.minFactor));
+          const htfSmoothF = ema(htfRawF, p.smoothLength);
           const htfST = adaptiveST(htfData, htfAtr, htfSmoothF);
           setHtfResult(htfST);
         } catch (e) {
@@ -1875,7 +2310,22 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [symbol, interval, startDate, endDate, htfMultiplier, params]);
+  }, [symbol, interval, startDate, endDate, htfMultiplier]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => { fetch(); }, 350);
+    return () => clearTimeout(timer);
+  }, [fetch]);
+
+  useEffect(() => {
+    if (!htfCandles?.length || htfMultiplier <= 0) return;
+    const p = paramsRef.current;
+    const htfAtr = atrRMA(htfCandles, p.atrPeriod);
+    const htfEr = p.useVWER ? volumeWeightedER(htfCandles, p.erLength) : kaufmanER(htfCandles, p.erLength);
+    const htfRawF = htfEr.map(e => p.maxFactor - e * (p.maxFactor - p.minFactor));
+    const htfSmoothF = ema(htfRawF, p.smoothLength);
+    setHtfResult(adaptiveST(htfCandles, htfAtr, htfSmoothF));
+  }, [htfCandles, htfMultiplier, params.atrPeriod, params.erLength, params.smoothLength, params.minFactor, params.maxFactor, params.useVWER]);
 
   const applyPreset = useCallback(days => {
     setEndDate(toISO(now));
@@ -1888,23 +2338,21 @@ export default function App() {
   const runOpt = useCallback(async () => {
     if (!candles.length) return;
     setOptRunning(true); setOptProgress(0); setOptResults(null);
-    const ranges = {
-      atrPeriod: [8, 10, 14],
-      erLength: [10, 14, 20],
-      smoothLength: [3, 5, 8],
-      minFactor: [1.0, 1.5, 2.0, 2.5],
-      maxFactor: [3.0, 4.0, 5.0, 6.0],
-    };
+    const ranges = buildOptRanges(candles.length > 2500);
     setTimeout(() => {
       try {
-        const results = runOptimization(candles, params, ranges, p => setOptProgress(p));
+        const regimeModel = buildRegimeModel(candles);
+        const { results } = runSmartOptimization(
+          candles, params, ranges, p => setOptProgress(p),
+          { useML, regimeModel, compact: candles.length > 2500, htfAlignedDir: null },
+        );
         setOptResults(results.slice(0, 20));
       } catch (e) {
         setError("Optimization failed: " + e.message);
       }
       setOptRunning(false);
     }, 50);
-  }, [candles, params]);
+  }, [candles, params, useML]);
 
   // ── Run Monte Carlo ──
   const runMC = useCallback(() => {
@@ -1929,13 +2377,7 @@ export default function App() {
       try {
         const trainSize = Math.floor(candles.length * 0.6);
         const testSize = Math.floor(candles.length * 0.2);
-        const optRanges = {
-          atrPeriod: [8, 10, 14],
-          erLength: [10, 14],
-          smoothLength: [3, 5],
-          minFactor: [1.0, 1.5, 2.0],
-          maxFactor: [3.0, 4.0, 5.0],
-        };
+        const optRanges = buildOptRanges(candles.length > 2500);
         const wf = runWalkForward(candles, params, optRanges, { trainSize, testSize });
         setWfResults(wf);
       } catch (e) {
@@ -1948,10 +2390,14 @@ export default function App() {
   const lastER = result?.er?.filter(v => !isNaN(v)).at(-1) ?? 0;
   const lastF = result?.smoothF?.filter(v => !isNaN(v)).at(-1) ?? 0;
   const lastCI = result?.ci?.filter(v => !isNaN(v)).at(-1) ?? 50;
-  const regime = lastER > 0.62 ? "Trending" : lastER > 0.38 ? "Mixed" : "Choppy";
-  const regimeColor = lastER > 0.62 ? C.accent : lastER > 0.38 ? C.yellow : C.red;
-
   const candleCount = candles.length;
+  const mlFeatures = candleCount > 0 ? extractMarketFeatures(candles) : null;
+  const mlRegime = result?.regimeModel && mlFeatures
+    ? classifyRegime(mlFeatures, result.regimeModel)
+    : null;
+  const regime = mlRegime?.label ?? (lastER > 0.62 ? "Trending" : lastER > 0.38 ? "Mixed" : "Choppy");
+  const regimeColor = regime === "Trending" ? C.accent : regime === "Mixed" ? C.yellow : C.red;
+
   const viewLen = viewRange[1] - viewRange[0];
 
   const moveView = dir => {
@@ -2002,8 +2448,8 @@ export default function App() {
             {PRESETS.map(p => <Pill key={p.label} onClick={() => applyPreset(p.days)}>{p.label}</Pill>)}
           </div>
 
-          <button onClick={fetch} disabled={loading} style={{ marginLeft: "auto", padding: "7px 20px", borderRadius: 7, cursor: loading ? "wait" : "pointer", background: loading ? C.border : C.accent + "22", border: `1px solid ${loading ? C.border : C.accent}66`, color: loading ? C.sub : C.accent, fontSize: 12, fontWeight: 700 }}>
-            {loading ? `Loading ${progress}%...` : "Fetch & Run"}
+          <button onClick={fetch} disabled={loading || tuning} style={{ marginLeft: "auto", padding: "7px 20px", borderRadius: 7, cursor: loading || tuning ? "wait" : "pointer", background: loading || tuning ? C.border : C.accent + "22", border: `1px solid ${loading || tuning ? C.border : C.accent}66`, color: loading || tuning ? C.sub : C.accent, fontSize: 12, fontWeight: 700 }}>
+            {loading ? `Loading ${progress}%...` : tuning ? `${useML ? "ML tuning" : "Tuning"} ${tuneProgress}%...` : "Refresh"}
           </button>
 
           <button onClick={() => setShowPine(true)} style={{ padding: "7px 14px", borderRadius: 7, cursor: "pointer", background: C.purple + "18", border: `1px solid ${C.purple}44`, color: C.purple, fontSize: 11, fontWeight: 600 }}>Pine</button>
@@ -2020,14 +2466,49 @@ export default function App() {
         {/* Sidebar */}
         <div style={{ width: 215, flexShrink: 0, borderRight: `1px solid ${C.border}`, padding: "16px 14px", background: C.panel, overflowY: "auto" }}>
 
-          <div style={{ fontSize: 9, color: C.sub, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 14 }}>Core Parameters</div>
-          <Slider label="ATR Period" value={params.atrPeriod} min={5} max={30} step={1} onChange={setP("atrPeriod")} />
-          <Slider label="Min Factor" value={params.minFactor} min={0.5} max={3.5} step={0.1} onChange={setP("minFactor")} unit="x" color={C.accent} />
-          <Slider label="Max Factor" value={params.maxFactor} min={2.0} max={9.0} step={0.1} onChange={setP("maxFactor")} unit="x" color={C.red} />
+          <Toggle label="Auto-Tune (Runtime)" value={autoTune} onChange={setAutoTune} color={C.purple} />
+          <Toggle label="ML Engine (GA + Regime)" value={useML} onChange={setUseML} color={C.blue} />
+          {autoTune && (
+            <div style={{ marginBottom: 14, padding: "8px 10px", borderRadius: 8, background: C.bg, border: `1px solid ${C.purple}44` }}>
+              <div style={{ fontSize: 9, color: C.purple, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 6 }}>
+                {tuning ? `Tuning ${tuneProgress}%` : useML ? "ML Adaptive Active" : "Grid Adaptive Active"}
+              </div>
+              {result?.adaptiveConfig && (
+                <>
+                  <StatRow label="Lookback" value={`${result.adaptiveConfig.lookback} bars`} color={C.sub} mono />
+                  <StatRow label="Re-tune every" value={`${result.adaptiveConfig.retuneEvery} bars`} color={C.sub} mono />
+                </>
+              )}
+              {useML && mlRegime && (
+                <>
+                  <StatRow label="ML Regime" value={mlRegime.label} color={regimeColor} />
+                  <StatRow label="Confidence" value={`${(mlRegime.confidence * 100).toFixed(0)}%`} color={C.blue} mono />
+                </>
+              )}
+              {tuneLog?.length > 0 && (
+                <StatRow label="Tune windows" value={tuneLog.length} color={C.purple} mono />
+              )}
+              {tuneLog?.length > 0 && (
+                <StatRow label="Optimizer" value={tuneLog.at(-1)?.method ?? "—"} color={C.sub} mono />
+              )}
+              {candleCount > 0 && !tuning && (
+                <button onClick={() => setRetuneToken(t => t + 1)} style={{ marginTop: 8, width: "100%", padding: "5px 8px", borderRadius: 6, border: `1px solid ${C.purple}66`, background: C.purple + "18", color: C.purple, fontSize: 10, cursor: "pointer" }}>
+                  Re-tune Now
+                </button>
+              )}
+            </div>
+          )}
+
+          <div style={{ fontSize: 9, color: C.sub, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 14 }}>
+            Core Parameters{autoTune ? " (auto)" : ""}
+          </div>
+          <Slider label="ATR Period" value={params.atrPeriod} min={5} max={30} step={1} onChange={setP("atrPeriod")} disabled={autoTune} />
+          <Slider label="Min Factor" value={params.minFactor} min={0.5} max={3.5} step={0.1} onChange={setP("minFactor")} unit="x" color={C.accent} disabled={autoTune} />
+          <Slider label="Max Factor" value={params.maxFactor} min={2.0} max={9.0} step={0.1} onChange={setP("maxFactor")} unit="x" color={C.red} disabled={autoTune} />
 
           <div style={{ fontSize: 9, color: C.sub, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 14, marginTop: 16 }}>Efficiency Engine</div>
-          <Slider label="ER Window" value={params.erLength} min={5} max={50} step={1} onChange={setP("erLength")} color={C.purple} />
-          <Slider label="EMA Smooth" value={params.smoothLength} min={1} max={20} step={1} onChange={setP("smoothLength")} color={C.yellow} />
+          <Slider label="ER Window" value={params.erLength} min={5} max={50} step={1} onChange={setP("erLength")} color={C.purple} disabled={autoTune} />
+          <Slider label="EMA Smooth" value={params.smoothLength} min={1} max={20} step={1} onChange={setP("smoothLength")} color={C.yellow} disabled={autoTune} />
 
           <div style={{ fontSize: 9, color: C.sub, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 14, marginTop: 16 }}>Risk Management</div>
           <Toggle label="Trailing Stop" value={params.useTrailingStop} onChange={setP("useTrailingStop")} color={C.blue} />
@@ -2046,6 +2527,12 @@ export default function App() {
             <Slider label="Chop Threshold" value={params.chopThreshold} min={50} max={80} step={1} onChange={setP("chopThreshold")} color={C.blue} />
           )}
           <Toggle label="Volume-Weighted ER" value={params.useVWER} onChange={setP("useVWER")} color={C.orange} />
+
+          <div style={{ fontSize: 9, color: C.sub, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 14, marginTop: 16 }}>ML Signal Filter</div>
+          <Toggle label="Logistic Filter" value={params.useMLFilter} onChange={setP("useMLFilter")} color={C.blue} />
+          {params.useMLFilter && (
+            <Slider label="ML Threshold" value={params.mlThreshold} min={0.3} max={0.7} step={0.02} onChange={setP("mlThreshold")} color={C.blue} />
+          )}
 
           <div style={{ fontSize: 9, color: C.sub, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 14, marginTop: 16 }}>Multi-Timeframe</div>
           <div style={{ fontSize: 10, color: C.sub, marginBottom: 8 }}>HTF Confluence</div>
@@ -2067,6 +2554,9 @@ export default function App() {
             <StatRow label="Factor" value={lastF.toFixed(2) + "x"} color={C.yellow} mono />
             <StatRow label="Choppiness" value={lastCI.toFixed(1)} color={lastCI > 61.8 ? C.red : lastCI > 50 ? C.yellow : C.accent} mono />
             <StatRow label="Regime" value={regime} color={regimeColor} />
+            {mlRegime && useML && (
+              <StatRow label="ML Confidence" value={`${(mlRegime.confidence * 100).toFixed(0)}%`} color={C.blue} mono />
+            )}
             {candleCount > 0 && <StatRow label="Bars" value={candleCount.toLocaleString()} color={C.sub} mono />}
           </div>
 
@@ -2115,13 +2605,22 @@ export default function App() {
         {/* Main Content */}
         <div ref={containerRef} style={{ flex: 1, padding: "14px 16px", overflow: "hidden" }}>
 
-          {!candleCount && !loading && (
+          {!candleCount && (loading || tuning) && (
             <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: 300, color: C.sub, gap: 12 }}>
               <div style={{ fontSize: 28, color: C.accent, fontWeight: 700 }}>Adaptive Supertrend PRO</div>
-              <div style={{ fontSize: 13, color: C.label }}>Select symbol, interval & date range, then click Fetch & Run</div>
+              <div style={{ fontSize: 13, color: C.label }}>
+                {loading ? `Fetching ${symbol} ${interval}… ${progress}%` : `${useML ? "ML tuning" : "Tuning"}… ${tuneProgress}%`}
+              </div>
+            </div>
+          )}
+
+          {!candleCount && !loading && !tuning && (
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: 300, color: C.sub, gap: 12 }}>
+              <div style={{ fontSize: 28, color: C.accent, fontWeight: 700 }}>Adaptive Supertrend PRO</div>
+              <div style={{ fontSize: 13, color: C.label }}>Auto-loads on startup — change symbol, interval, or dates to re-run</div>
               <div style={{ fontSize: 11, color: C.sub }}>Pulls live OHLCV from Binance FAPI — no key needed</div>
               <div style={{ fontSize: 10, color: C.sub + "88", marginTop: 8, textAlign: "center", lineHeight: 1.6 }}>
-                v2.1: Trailing Stops &middot; Break-Even &middot; ATR Sizing &middot; Multi-TF Confluence &middot; Walk-Forward &middot; Monte Carlo &middot; Crosshair Tooltips
+                v2.3: ML Genetic Optimizer &middot; K-Means Regime &middot; Logistic Signal Filter &middot; Runtime Auto-Tune
               </div>
             </div>
           )}
@@ -2198,7 +2697,9 @@ export default function App() {
                   <Panel>
                     <div style={{ padding: "12px 14px" }}>
                       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-                        <span style={{ fontSize: 11, color: C.label }}>Parameter Optimization (minF x maxF heatmap)</span>
+                        <span style={{ fontSize: 11, color: C.label }}>
+                          {autoTune ? "Auto-Tune — profitable params only (+PnL & equity)" : "Parameter Optimization — profitable results only"}
+                        </span>
                         <button onClick={runOpt} disabled={optRunning} style={{ padding: "5px 14px", borderRadius: 6, border: `1px solid ${optRunning ? C.border : C.accent}66`, background: optRunning ? C.border : C.accent + "22", color: optRunning ? C.sub : C.accent, fontSize: 11, cursor: optRunning ? "wait" : "pointer" }}>
                           {optRunning ? `Running ${optProgress}%...` : "Run Optimization"}
                         </button>
