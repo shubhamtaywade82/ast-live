@@ -3,13 +3,21 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "scripts": {
     "dev": "vite",
+    "dev:api": "node server/index.js",
+    "dev:all": "concurrently -k -n api,web -c blue,green \"npm run dev:api\" \"AST_SKIP_EMBED_API=1 wait-on http://127.0.0.1:${AST_API_PORT:-3210}/api/health -t 60000 && npm run dev\"",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "start:api": "node server/index.js"
   },
   "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
     "react": "^19.2.6",
     "react-dom": "^19.2.6"
   },
@@ -22,6 +30,8 @@
     "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.2",
     "globals": "^17.6.0",
+    "concurrently": "^9.1.2",
+    "wait-on": "^8.0.3",
     "vite": "^8.0.12"
   }
 }

@@ -13,6 +13,30 @@ import {
   isProfitableBacktest,
 } from "./ml/engine.js";
 import { runMLOptimization } from "./ml/optimize.js";
+import {
+  BACKGROUND_SYMBOLS,
+  BACKGROUND_INTERVALS,
+} from "../shared/market.js";
+import {
+  loadPresets,
+  savePreset,
+  findBestPreset,
+  listPresets,
+  clearPresets,
+  loadTuneLog,
+  startBackgroundScan,
+  getBackgroundStatus,
+} from "./storage/presetStore.js";
+import { fetchKlinesApi, isApiAvailable } from "./api/client.js";
+
+function setBucketed(setter, value, step = 5) {
+  const bucket = Math.min(100, Math.round(value / step) * step);
+  setter(prev => (prev === bucket ? prev : bucket));
+}
+
+function setIfChanged(setter, value) {
+  setter(prev => (Object.is(prev, value) ? prev : value));
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ADAPTIVE SUPERTRIND PRO v2.1 — Continued Enhancements
@@ -888,6 +912,131 @@ function mergeEquityPositiveParams(existing, incoming) {
     }
   }
   return merged.sort((a, b) => (b.equityEnd ?? 0) - (a.equityEnd ?? 0));
+}
+
+function buildPresetFromView(ctx) {
+  const {
+    symbol, interval, htfMultiplier, startDate, endDate, candles, result, params, source = "manual",
+  } = ctx;
+  if (!candles?.length || !result) return null;
+  const equityStart = params.startEquity || 10000;
+  const equityEnd = result.equityCurve?.filter(v => !isNaN(v)).at(-1) ?? equityStart;
+  if (equityEnd <= equityStart) return null;
+
+  const tuned = result.tunedParams ?? params;
+  return {
+    symbol,
+    interval,
+    htfMultiplier,
+    startDate,
+    endDate,
+    startMs: candles[0].t,
+    endMs: candles.at(-1).t,
+    params: normalizeParams(tuned, AUTO_TUNE_KEYS),
+    equityStart,
+    equityEnd,
+    equityGain: equityEnd - equityStart,
+    netReturn: parseFloat(result.stats?.netReturn ?? 0),
+    sharpe: result.stats?.sharpe,
+    maxDD: result.stats?.maxDD,
+    totalTrades: result.stats?.totalTrades,
+    regime: result.currentRegime?.label ?? result.mlMeta?.regime?.label,
+    regimeConfidence: result.currentRegime?.confidence ?? result.mlMeta?.regime?.confidence,
+    barCount: candles.length,
+    source,
+  };
+}
+
+async function resolveHtfAligned(candles, symbol, interval, htfMultiplier, tuneParams, startMs, endMs) {
+  if (!htfMultiplier || htfMultiplier <= 0) return { htfAligned: null, htfCandles: null, htfResult: null };
+
+  const htfMs = (INTERVALS.find(i => i.label === interval)?.ms ?? 3600e3) * htfMultiplier;
+  const htfLabel = INTERVALS.find(i => i.ms >= htfMs)?.label || interval;
+  const htfData = await fetchKlines(symbol, htfLabel, startMs, endMs);
+  const htfAtr = atrRMA(htfData, tuneParams.atrPeriod);
+  const htfEr = tuneParams.useVWER
+    ? volumeWeightedER(htfData, tuneParams.erLength)
+    : kaufmanER(htfData, tuneParams.erLength);
+  const htfRawF = htfEr.map(e => tuneParams.maxFactor - e * (tuneParams.maxFactor - tuneParams.minFactor));
+  const htfSmoothF = ema(htfRawF, tuneParams.smoothLength);
+  const htfST = adaptiveST(htfData, htfAtr, htfSmoothF);
+  const htfAligned = alignHTFDir(candles, htfData, htfST.dir);
+  return { htfAligned, htfCandles: htfData, htfResult: htfST };
+}
+
+async function tuneConfigurationJob(job, baseParams) {
+  const intervalMs = INTERVALS.find(i => i.label === job.interval)?.ms ?? 3600e3;
+  const barsPerYear = Math.max(1, Math.round((365.25 * 86400e3) / intervalMs));
+  const tuneParams = { ...baseParams, barsPerYear };
+
+  const candles = await fetchKlines(job.symbol, job.interval, job.startMs, job.endMs);
+  if (candles.length < 100) return null;
+
+  const { htfAligned } = await resolveHtfAligned(
+    candles, job.symbol, job.interval, job.htfMultiplier, tuneParams, job.startMs, job.endMs,
+  ).catch(() => ({ htfAligned: null }));
+
+  const config = getAdaptiveConfig(candles.length);
+  const ranges = buildOptRanges(true);
+  const r = runAdaptiveBacktest(candles, tuneParams, ranges, config, htfAligned, null, { useML: true });
+
+  const searchEntries = runEquityPositiveParamSearch(candles, tuneParams, htfAligned, null);
+  const bestEntry = searchEntries[0];
+  const tunedParams = r.tunedParams ?? bestEntry?.params;
+  if (!tunedParams) return null;
+
+  const equityStart = tuneParams.startEquity || 10000;
+  const equityEnd = r.equityCurve?.filter(v => !isNaN(v)).at(-1) ?? equityStart;
+  if (equityEnd <= equityStart) return null;
+
+  return {
+    symbol: job.symbol,
+    interval: job.interval,
+    htfMultiplier: job.htfMultiplier,
+    startDate: job.startDate,
+    endDate: job.endDate,
+    startMs: job.startMs,
+    endMs: job.endMs,
+    params: normalizeParams(tunedParams, AUTO_TUNE_KEYS),
+    equityStart,
+    equityEnd,
+    equityGain: equityEnd - equityStart,
+    netReturn: parseFloat(r.stats?.netReturn ?? bestEntry?.netReturn ?? 0),
+    sharpe: r.stats?.sharpe,
+    maxDD: r.stats?.maxDD,
+    totalTrades: r.stats?.totalTrades,
+    regime: r.currentRegime?.label ?? bestEntry?.regime ?? r.mlMeta?.regime?.label,
+    regimeConfidence: r.currentRegime?.confidence ?? r.mlMeta?.regime?.confidence,
+    barCount: candles.length,
+    source: "background",
+  };
+}
+
+function runBacktestFromPreset(candles, baseParams, preset, htfAligned) {
+  const merged = normalizeParams({ ...baseParams, ...preset.params });
+  const filtered = attachMLSignalFilter(candles, merged, htfAligned);
+  const r = runBacktest(candles, filtered, htfAligned);
+  return {
+    ...r,
+    adaptive: true,
+    fromPreset: true,
+    presetId: preset.id,
+    tunedParams: preset.params,
+    currentRegime: preset.regime ? { label: preset.regime, confidence: preset.regimeConfidence } : null,
+  };
+}
+
+function prioritizeJobs(jobs, current) {
+  if (!current?.symbol) return jobs;
+  const head = [];
+  const tail = [];
+  for (const job of jobs) {
+    const isCurrent = job.symbol === current.symbol
+      && job.interval === current.interval
+      && job.htfMultiplier === current.htfMultiplier;
+    (isCurrent ? head : tail).push(job);
+  }
+  return [...head, ...tail];
 }
 
 function resultsToEquityEntries(results, startEquity, source = "full-search") {
@@ -2424,6 +2573,19 @@ export default function App() {
   const [profitableParams, setProfitableParams] = useState([]);
   const profitableParamsRef = useRef([]);
   const [retuneToken, setRetuneToken] = useState(0);
+  const appliedPresetRef = useRef(null);
+  const bgStopRef = useRef(false);
+  const foregroundBusyRef = useRef(false);
+
+  const [backgroundScan, setBackgroundScan] = useState(true);
+  const [bgRunning, setBgRunning] = useState(false);
+  const [bgProgress, setBgProgress] = useState(0);
+  const [bgStatus, setBgStatus] = useState("");
+  const [savedPresets, setSavedPresets] = useState([]);
+  const [tuneActivityLog, setTuneActivityLog] = useState([]);
+  const [apiConnected, setApiConnected] = useState(false);
+  const [selectedPresetId, setSelectedPresetId] = useState(null);
+  const [optimizedFilter, setOptimizedFilter] = useState({ symbol: "", interval: "" });
 
   const [params, setParams] = useState({
     atrPeriod: 10, erLength: 14, smoothLength: 5,
@@ -2465,6 +2627,21 @@ export default function App() {
     return () => obs.disconnect();
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const ok = await isApiAvailable();
+      if (cancelled) return;
+      setApiConnected(ok);
+      setSavedPresets(await listPresets({
+        symbol: optimizedFilter.symbol || undefined,
+        interval: optimizedFilter.interval || undefined,
+      }));
+      setTuneActivityLog(await loadTuneLog());
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
   // ── Manual backtest (auto-tune off) ──
   useEffect(() => {
     if (!candles.length || autoTune) return;
@@ -2486,15 +2663,49 @@ export default function App() {
     if (!candles.length || !autoTune) return;
 
     let cancelled = false;
-    setTuning(true);
-    setTuneProgress(0);
-    setError("");
 
-    const timer = setTimeout(() => {
+    const timer = setTimeout(async () => {
+      if (cancelled) return;
+      setTuning(true);
+      setTuneProgress(0);
+      setError("");
+
       try {
         let htfAligned = null;
         if (htfResult && htfMultiplier > 0) {
           htfAligned = alignHTFDir(candles, htfCandles, htfResult.dir);
+        }
+
+        const cachedPreset = appliedPresetRef.current
+          ?? await findBestPreset({ symbol, interval, htfMultiplier, startDate, endDate });
+
+        if (cachedPreset?.params && cachedPreset.equityEnd > cachedPreset.equityStart) {
+          appliedPresetRef.current = null;
+          const r = runBacktestFromPreset(candles, paramsRef.current, cachedPreset, htfAligned);
+          const presetView = buildPresetFromView({
+            symbol, interval, htfMultiplier, startDate, endDate, candles, result: r,
+            params: { ...paramsRef.current, ...cachedPreset.params }, source: "preset-cache",
+          });
+          if (presetView) {
+            await savePreset(presetView);
+            setSavedPresets(await loadPresets());
+          }
+          setResult(r);
+          setTuneLog([{ window: 1, confirmed: true, params: cachedPreset.params, regime: cachedPreset.regime, source: "preset-cache" }]);
+          setProfitableParams([{ params: cachedPreset.params, equityEnd: cachedPreset.equityEnd, confirmed: true }]);
+          setOptResults([{
+            params: cachedPreset.params,
+            netReturn: cachedPreset.netReturn,
+            equityStart: cachedPreset.equityStart,
+            equityEnd: cachedPreset.equityEnd,
+            equityGain: cachedPreset.equityGain,
+            regime: cachedPreset.regime,
+            source: "preset-cache",
+          }]);
+          setParams(p => normalizeParams({ ...p, ...cachedPreset.params }));
+          setSelectedPresetId(cachedPreset.id);
+          if (!cancelled) setTuning(false);
+          return;
         }
 
         const config = getAdaptiveConfig(candles.length);
@@ -2505,7 +2716,7 @@ export default function App() {
           ranges,
           config,
           htfAligned,
-          p => { if (!cancelled) setTuneProgress(p); },
+          p => { if (!cancelled) setBucketed(setTuneProgress, p); },
         );
 
         if (cancelled) return;
@@ -2517,7 +2728,7 @@ export default function App() {
           candles,
           paramsRef.current,
           htfAligned,
-          p => { if (!cancelled) setTuneProgress(Math.min(99, 50 + Math.round(p * 0.5))); },
+          p => { if (!cancelled) setBucketed(setTuneProgress, Math.min(99, 50 + Math.round(p * 0.5))); },
         );
         if (cancelled) return;
         mergedHistory = mergeEquityPositiveParams(mergedHistory, searchEntries);
@@ -2535,6 +2746,16 @@ export default function App() {
             return AUTO_TUNE_KEYS.some(k => p[k] !== next[k]) ? next : p;
           });
         }
+
+        const presetView = buildPresetFromView({
+          symbol, interval, htfMultiplier, startDate, endDate, candles, result: r,
+          params: paramsRef.current, source: "adaptive",
+        });
+        if (presetView) {
+          await savePreset(presetView);
+          setSavedPresets(await loadPresets());
+          setTuneActivityLog(await loadTuneLog());
+        }
       } catch (e) {
         if (!cancelled) {
           console.error("Adaptive tune error:", e);
@@ -2549,7 +2770,90 @@ export default function App() {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [candles, adaptiveSettingsKey, htfResult, htfMultiplier, htfCandles, autoTune, retuneToken]);
+  }, [candles, adaptiveSettingsKey, htfResult, htfMultiplier, htfCandles, autoTune, retuneToken, symbol, interval, startDate, endDate]);
+
+  useEffect(() => {
+    foregroundBusyRef.current = loading || tuning;
+  }, [loading, tuning]);
+
+  // ── Background scan (server worker or client fallback) ──
+  useEffect(() => {
+    if (!backgroundScan) {
+      bgStopRef.current = true;
+      return;
+    }
+
+    bgStopRef.current = false;
+    let cancelled = false;
+
+    const pollServer = async () => {
+      await startBackgroundScan({ symbol, interval, htfMultiplier });
+      let lastPresetCount = -1;
+      while (!cancelled && backgroundScan && !bgStopRef.current) {
+        const status = await getBackgroundStatus();
+        if (status) {
+          setIfChanged(setBgRunning, status.running);
+          const s = status.stats ?? {};
+          const cur = status.currentJob;
+          const pct = s.total ? Math.round(((s.done ?? 0) / s.total) * 100) : 0;
+          setIfChanged(setBgProgress, pct);
+          const statusText = cur
+            ? `${cur.symbol} ${cur.interval} · ${s.done ?? 0}/${s.total ?? 0} done`
+            : `Queue: ${s.pending ?? 0} pending, ${s.done ?? 0} done`;
+          setIfChanged(setBgStatus, statusText);
+        }
+        const presets = await loadPresets();
+        if (presets.length !== lastPresetCount) {
+          lastPresetCount = presets.length;
+          setSavedPresets(presets);
+        }
+        await new Promise(r => setTimeout(r, 10000));
+      }
+    };
+
+    const runClientFallback = async () => {
+      const { createBackgroundQueue, runBackgroundTuner } = await import("./worker/backgroundTuner.js");
+      const queue = prioritizeJobs(createBackgroundQueue(), { symbol, interval, htfMultiplier });
+      setBgRunning(true);
+      setBgProgress(0);
+      setBgStatus(`Queued ${queue.length} configurations (client)`);
+      await runBackgroundTuner({
+        jobs: queue,
+        shouldStop: () => cancelled || bgStopRef.current || !backgroundScan,
+        shouldPause: () => foregroundBusyRef.current,
+        delayMs: 150,
+        runJob: job => tuneConfigurationJob(job, paramsRef.current),
+        onJobStart: (job, done, total) => setBgStatus(`${job.symbol} ${job.interval} (${done + 1}/${total})`),
+        onJobComplete: async (_job, preset) => {
+          if (preset?.equityEnd > preset?.equityStart) {
+            await savePreset(preset);
+            setSavedPresets(await loadPresets());
+            setTuneActivityLog(await loadTuneLog());
+          }
+        },
+        onProgress: (pct, meta) => {
+          setBucketed(setBgProgress, pct);
+          if (meta?.saved != null) setIfChanged(setBgStatus, `${meta.saved} saved · ${meta.completed}/${meta.total}`);
+        },
+      });
+      if (!cancelled) { setBgRunning(false); setBgStatus("Background scan complete"); }
+    };
+
+    const timer = setTimeout(async () => {
+      if (await isApiAvailable()) {
+        setApiConnected(true);
+        await pollServer();
+      } else {
+        await runClientFallback();
+      }
+    }, 1500);
+
+    return () => {
+      cancelled = true;
+      bgStopRef.current = true;
+      clearTimeout(timer);
+    };
+  }, [backgroundScan, symbol, interval, htfMultiplier]);
 
   // ── Full parameter search (positive final equity) when auto-tune is off ──
   useEffect(() => {
@@ -2571,7 +2875,7 @@ export default function App() {
           candles,
           paramsRef.current,
           htfAligned,
-          p => { if (!cancelled) setOptProgress(p); },
+          p => { if (!cancelled) setBucketed(setOptProgress, p); },
         );
         if (cancelled) return;
 
@@ -2604,56 +2908,129 @@ export default function App() {
   }, [candles]);
 
   // ── Fetch data ──
-  const fetch = useCallback(async () => {
+  const fetch = useCallback(async (override = null) => {
+    const sym = override?.symbol ?? symbol;
+    const iv = override?.interval ?? interval;
+    const sd = override?.startDate ?? startDate;
+    const ed = override?.endDate ?? endDate;
+    const htfMult = override?.htfMultiplier ?? htfMultiplier;
+    const tuneParams = override?.params
+      ? normalizeParams({ ...paramsRef.current, ...override.params })
+      : paramsRef.current;
+
     setLoading(true); setError(""); setProgress(0);
     setCandles([]); setResult(null); setOptResults(null); setMcResults(null); setWfResults(null);
     setHtfCandles(null); setHtfResult(null); setTuneLog(null);
     setProfitableParams([]);
     profitableParamsRef.current = [];
 
-    const intervalMs = INTERVALS.find(i => i.label === interval)?.ms ?? 3600e3;
+    const intervalMs = INTERVALS.find(i => i.label === iv)?.ms ?? 3600e3;
     const barsPerYear = Math.max(1, Math.round((365.25 * 86400e3) / intervalMs));
-    setParams(p => ({ ...p, barsPerYear }));
+    setParams(p => ({ ...p, ...tuneParams, barsPerYear }));
 
     try {
-      const startMs = fromISO(startDate);
-      const endMs = Math.min(fromISO(endDate) + 86400e3 - 1, now);
+      const startMs = fromISO(sd);
+      const endMs = Math.min(fromISO(ed) + 86400e3 - 1, now);
       if (startMs >= endMs) throw new Error("Start date must be before end date");
 
-      const data = await fetchKlines(symbol, interval, startMs, endMs, p => setProgress(p));
+      const data = apiConnected
+        ? await fetchKlinesApi(sym, iv, startMs, endMs).catch(() => fetchKlines(sym, iv, startMs, endMs, p => setBucketed(setProgress, p)))
+        : await fetchKlines(sym, iv, startMs, endMs, p => setBucketed(setProgress, p));
       if (!data.length) throw new Error("No data returned");
-      setCandles(data);
-      setProgress(100);
 
-      // Fetch HTF data if confluence enabled
-      if (htfMultiplier > 0) {
-        const htfMs = INTERVALS.find(i => i.label === interval)?.ms * htfMultiplier;
-        const htfLabel = INTERVALS.find(i => i.ms >= htfMs)?.label || interval;
+      let nextHtfCandles = null;
+      let nextHtfResult = null;
+      if (htfMult > 0) {
+        const htfMs = INTERVALS.find(i => i.label === iv)?.ms * htfMult;
+        const htfLabel = INTERVALS.find(i => i.ms >= htfMs)?.label || iv;
         try {
-          const htfData = await fetchKlines(symbol, htfLabel, startMs, endMs);
-          setHtfCandles(htfData);
-          // Compute ST on HTF
-          const htfAtr = atrRMA(htfData, params.atrPeriod);
-          const htfEr = params.useVWER ? volumeWeightedER(htfData, params.erLength) : kaufmanER(htfData, params.erLength);
-          const htfRawF = htfEr.map(e => params.maxFactor - e * (params.maxFactor - params.minFactor));
-          const htfSmoothF = ema(htfRawF, params.smoothLength);
-          const htfST = adaptiveST(htfData, htfAtr, htfSmoothF);
-          setHtfResult(htfST);
+          const htfData = await fetchKlines(sym, htfLabel, startMs, endMs);
+          const htfAtr = atrRMA(htfData, tuneParams.atrPeriod);
+          const htfEr = tuneParams.useVWER ? volumeWeightedER(htfData, tuneParams.erLength) : kaufmanER(htfData, tuneParams.erLength);
+          const htfRawF = htfEr.map(e => tuneParams.maxFactor - e * (tuneParams.maxFactor - tuneParams.minFactor));
+          const htfSmoothF = ema(htfRawF, tuneParams.smoothLength);
+          nextHtfCandles = htfData;
+          nextHtfResult = adaptiveST(htfData, htfAtr, htfSmoothF);
         } catch (e) {
           console.warn("HTF fetch failed:", e);
         }
       }
+
+      setHtfCandles(nextHtfCandles);
+      setHtfResult(nextHtfResult);
+      setCandles(data);
+      setProgress(100);
     } catch (e) {
       setError(e.message || "Fetch failed");
     } finally {
       setLoading(false);
     }
-  }, [symbol, interval, startDate, endDate, htfMultiplier, params]);
+  }, [symbol, interval, startDate, endDate, htfMultiplier, now, apiConnected]);
+
+  const refreshPresets = useCallback(async () => {
+    setSavedPresets(await listPresets({ symbol: optimizedFilter.symbol || undefined, interval: optimizedFilter.interval || undefined }));
+    setTuneActivityLog(await loadTuneLog());
+  }, [optimizedFilter]);
+
+  const filterMountedRef = useRef(false);
+
+  useEffect(() => {
+    if (!filterMountedRef.current) {
+      filterMountedRef.current = true;
+      return;
+    }
+    refreshPresets();
+  }, [optimizedFilter.symbol, optimizedFilter.interval, refreshPresets]);
 
   const applyPreset = useCallback(days => {
     setEndDate(toISO(now));
     setStartDate(toISO(now - days * 86400e3));
-  }, []);
+  }, [now]);
+
+  const loadOptimizedPreset = useCallback(async (preset) => {
+    appliedPresetRef.current = preset;
+    setSelectedPresetId(preset.id);
+    setSymbol(preset.symbol);
+    setInterval(preset.interval);
+    setStartDate(preset.startDate);
+    setEndDate(preset.endDate);
+    setHtfMultiplier(preset.htfMultiplier ?? 0);
+    setParams(p => normalizeParams({ ...p, ...preset.params }));
+    setActiveTab("overview");
+    await fetch(preset);
+  }, [fetch]);
+
+  const handleFineTune = useCallback(async () => {
+    const preset = await findBestPreset({ symbol, interval, htfMultiplier, startDate, endDate });
+    if (preset) {
+      appliedPresetRef.current = preset;
+      setSelectedPresetId(preset.id);
+      setParams(p => normalizeParams({ ...p, ...preset.params }));
+    }
+    setRetuneToken(t => t + 1);
+  }, [symbol, interval, htfMultiplier, startDate, endDate]);
+
+  const cachedPreset = useMemo(() => {
+    const exact = savedPresets.find(p =>
+      p.symbol === symbol && p.interval === interval
+      && (p.htfMultiplier ?? 0) === (htfMultiplier ?? 0)
+      && p.startDate === startDate && p.endDate === endDate
+      && p.equityEnd > p.equityStart,
+    );
+    if (exact) return exact;
+    return savedPresets.find(p =>
+      p.symbol === symbol && p.interval === interval
+      && (p.htfMultiplier ?? 0) === (htfMultiplier ?? 0)
+      && p.equityEnd > p.equityStart,
+    ) ?? null;
+  }, [savedPresets, symbol, interval, htfMultiplier, startDate, endDate]);
+
+  const filteredPresets = useMemo(() => {
+    let list = savedPresets;
+    if (optimizedFilter.symbol) list = list.filter(p => p.symbol === optimizedFilter.symbol);
+    if (optimizedFilter.interval) list = list.filter(p => p.interval === optimizedFilter.interval);
+    return list;
+  }, [savedPresets, optimizedFilter]);
 
   const setP = k => v => setParams(p => normalizeParams({ ...p, [k]: v }));
 
@@ -2672,7 +3049,7 @@ export default function App() {
           candles,
           params,
           htfAligned,
-          p => setOptProgress(p),
+          p => setBucketed(setOptProgress, p),
         );
         const merged = mergeEquityPositiveParams(profitableParamsRef.current, entries);
         profitableParamsRef.current = merged;
@@ -2748,7 +3125,7 @@ export default function App() {
   };
 
   const s = result?.stats;
-  const tabs = ["overview", "monthly", "optimize", "montecarlo", "walkforward"];
+  const tabs = ["overview", "optimized", "monthly", "optimize", "montecarlo", "walkforward"];
 
   return (
     <div style={{ background: C.bg, minHeight: "100vh", width: "100%", color: C.text, fontFamily: "-apple-system,'SF Pro Text',sans-serif" }}>
@@ -2796,6 +3173,15 @@ export default function App() {
         <div style={{ width: 215, flexShrink: 0, borderRight: `1px solid ${C.border}`, padding: "16px 14px", background: C.panel, overflowY: "auto" }}>
 
           <Toggle label="Auto-Tune (All Params)" value={autoTune} onChange={setAutoTune} color={C.purple} />
+          <Toggle label="Background Scan" value={backgroundScan} onChange={setBackgroundScan} color={C.blue} />
+          {(bgRunning || bgStatus) && (
+            <div style={{ marginBottom: 10, padding: "6px 8px", borderRadius: 6, background: C.bg, border: `1px solid ${C.blue}33`, fontSize: 9 }}>
+              <div style={{ color: C.blue, marginBottom: 4 }}>{bgRunning ? `Background ${bgProgress}%` : "Background"}</div>
+              <div style={{ color: C.sub, lineHeight: 1.4 }}>{bgStatus || "Idle"}</div>
+              <StatRow label="Saved presets" value={savedPresets.length} color={C.accent} mono />
+              {apiConnected && <StatRow label="Backend" value="connected" color={C.accent} mono />}
+            </div>
+          )}
           {autoTune && (
             <div style={{ marginBottom: 14, padding: "8px 10px", borderRadius: 8, background: C.bg, border: `1px solid ${C.purple}44` }}>
               <div style={{ fontSize: 9, color: C.purple, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 6 }}>
@@ -2817,8 +3203,8 @@ export default function App() {
                 </>
               )}
               {candleCount > 0 && !tuning && (
-                <button onClick={() => setRetuneToken(t => t + 1)} style={{ marginTop: 8, width: "100%", padding: "5px 8px", borderRadius: 6, border: `1px solid ${C.purple}66`, background: C.purple + "18", color: C.purple, fontSize: 10, cursor: "pointer" }}>
-                  Re-tune Now
+                <button onClick={handleFineTune} style={{ marginTop: 8, width: "100%", padding: "5px 8px", borderRadius: 6, border: `1px solid ${C.purple}66`, background: C.purple + "18", color: C.purple, fontSize: 10, cursor: "pointer" }}>
+                  Fine Tune {cachedPreset ? "(cached)" : ""}
                 </button>
               )}
             </div>
@@ -2926,24 +3312,27 @@ export default function App() {
         {/* Main Content */}
         <div ref={containerRef} style={{ flex: 1, padding: "14px 16px", overflow: "hidden" }}>
 
-          {!candleCount && !loading && (
+          {!candleCount && !loading && activeTab !== "optimized" && (
             <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: 300, color: C.sub, gap: 12 }}>
               <div style={{ fontSize: 28, color: C.accent, fontWeight: 700 }}>Adaptive Supertrend PRO</div>
               <div style={{ fontSize: 13, color: C.label }}>Select symbol, interval & date range, then click Fetch & Run</div>
               <div style={{ fontSize: 11, color: C.sub }}>Pulls live OHLCV from Binance FAPI — no key needed</div>
               <div style={{ fontSize: 10, color: C.sub + "88", marginTop: 8, textAlign: "center", lineHeight: 1.6 }}>
-                v2.2: Runtime Auto-Tune &middot; Rolling Walk-Forward Params &middot; Trailing Stops &middot; Monte Carlo &middot; Multi-TF Confluence
+                Background scan builds an Optimized library — open the Optimized tab to load a finetuned config
               </div>
             </div>
           )}
 
-          {candleCount > 0 && result && (
+          {(activeTab === "optimized" || (candleCount > 0 && result)) && (
             <>
               {/* Controls */}
+              {candleCount > 0 && result && (
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
                 <span style={{ fontSize: 10, color: C.label, fontFamily: "monospace" }}>
                   {symbol} &middot; {interval} &middot; {candleCount.toLocaleString()} bars &middot; {fmtDate(candles[0].t)} to {fmtDate(candles[candleCount - 1].t)}
                   {htfMultiplier > 0 && ` &middot; HTF: ${htfMultiplier}x`}
+                  {result.fromPreset && " · from optimized preset"}
+                  {selectedPresetId && ` · preset ${selectedPresetId.slice(0, 24)}…`}
                 </span>
                 <div style={{ display: "flex", gap: 4, marginLeft: "auto" }}>
                   <button onClick={() => zoomView(1)} style={navBtn}>+</button>
@@ -2957,18 +3346,100 @@ export default function App() {
                   {regime}{regimeConfidence ? ` ${(regimeConfidence * 100).toFixed(0)}%` : ""} ER={(lastER * 100).toFixed(0)}% CI={lastCI.toFixed(0)}
                 </div>
               </div>
+              )}
 
               {/* Tab Navigation */}
               <div style={{ display: "flex", gap: 4, marginBottom: 10, flexWrap: "wrap" }}>
                 {tabs.map(tab => (
                   <Pill key={tab} active={activeTab === tab} onClick={() => setActiveTab(tab)}>
-                    {tab === "overview" ? "Overview" : tab === "monthly" ? "Monthly" : tab === "optimize" ? "Optimize" : tab === "montecarlo" ? "Monte Carlo" : "Walk-Forward"}
+                    {tab === "overview" ? "Overview" : tab === "optimized" ? `Optimized (${savedPresets.length})` : tab === "monthly" ? "Monthly" : tab === "optimize" ? "Optimize" : tab === "montecarlo" ? "Monte Carlo" : "Walk-Forward"}
                   </Pill>
                 ))}
               </div>
 
+              {/* ── OPTIMIZED TAB (saved finetuned library) ── */}
+              {activeTab === "optimized" && (
+                <Panel title={`Optimized Library · ${filteredPresets.length} equity+ configs`}>
+                  <div style={{ padding: "12px 14px" }}>
+                    <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap", alignItems: "center" }}>
+                      <select value={optimizedFilter.symbol} onChange={e => setOptimizedFilter(f => ({ ...f, symbol: e.target.value }))} style={{ background: C.panel2, border: `1px solid ${C.border2}`, color: C.label, borderRadius: 6, padding: "4px 8px", fontSize: 10 }}>
+                        <option value="">All symbols</option>
+                        {BACKGROUND_SYMBOLS.map(s => <option key={s} value={s}>{s}</option>)}
+                      </select>
+                      <select value={optimizedFilter.interval} onChange={e => setOptimizedFilter(f => ({ ...f, interval: e.target.value }))} style={{ background: C.panel2, border: `1px solid ${C.border2}`, color: C.label, borderRadius: 6, padding: "4px 8px", fontSize: 10 }}>
+                        <option value="">All intervals</option>
+                        {BACKGROUND_INTERVALS.map(iv => <option key={iv} value={iv}>{iv}</option>)}
+                      </select>
+                      <button onClick={async () => { await clearPresets(); setSavedPresets([]); setTuneActivityLog([]); }} style={{ padding: "4px 10px", borderRadius: 6, border: `1px solid ${C.red}44`, background: C.red + "11", color: C.red, fontSize: 10, cursor: "pointer" }}>
+                        Clear library
+                      </button>
+                      <span style={{ fontSize: 9, color: C.sub, marginLeft: "auto" }}>
+                        {bgRunning ? `Scanning ${bgProgress}%` : backgroundScan ? (apiConnected ? "Server scan on" : "Client scan on") : "Background scan off"}
+                      </span>
+                    </div>
+                    {filteredPresets.length === 0 ? (
+                      <div style={{ padding: 24, textAlign: "center", color: C.sub, fontSize: 11 }}>
+                        No saved presets yet. Enable Background Scan to finetune all symbol × timeframe × HTF combinations.
+                        Only configs with positive final equity are stored.
+                      </div>
+                    ) : (
+                      <div style={{ maxHeight: 420, overflow: "auto" }}>
+                        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 9 }}>
+                          <thead>
+                            <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+                              <th style={{ padding: "4px 6px", color: C.sub, textAlign: "left" }}>Symbol</th>
+                              <th style={{ padding: "4px 6px", color: C.sub, textAlign: "left" }}>TF</th>
+                              <th style={{ padding: "4px 6px", color: C.sub, textAlign: "left" }}>HTF</th>
+                              <th style={{ padding: "4px 6px", color: C.sub, textAlign: "left" }}>Range</th>
+                              <th style={{ padding: "4px 6px", color: C.sub, textAlign: "left" }}>Reg</th>
+                              <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>Net%</th>
+                              <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>Final</th>
+                              <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>Gain</th>
+                              <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>Bars</th>
+                              <th style={{ padding: "4px 6px", color: C.sub, textAlign: "left" }}>Src</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {filteredPresets.map(p => (
+                              <tr
+                                key={p.id}
+                                style={{
+                                  borderBottom: `1px solid ${C.border}11`,
+                                  background: selectedPresetId === p.id ? C.accent + "18" : "transparent",
+                                  cursor: "pointer",
+                                }}
+                                onClick={() => loadOptimizedPreset(p)}
+                              >
+                                <td style={{ padding: "4px 6px", fontFamily: "monospace", color: C.text, fontWeight: 700 }}>{p.symbol}</td>
+                                <td style={{ padding: "4px 6px", fontFamily: "monospace", color: C.label }}>{p.interval}</td>
+                                <td style={{ padding: "4px 6px", fontFamily: "monospace", color: C.sub }}>{p.htfMultiplier ? `${p.htfMultiplier}x` : "—"}</td>
+                                <td style={{ padding: "4px 6px", fontFamily: "monospace", color: C.sub, fontSize: 8 }}>{p.startDate} → {p.endDate}</td>
+                                <td style={{ padding: "4px 6px", fontFamily: "monospace", color: C.purple, fontSize: 8 }}>{p.regime ?? "—"}</td>
+                                <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.accent }}>{p.netReturn?.toFixed?.(2) ?? p.netReturn}%</td>
+                                <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.accent }}>${Math.round(p.equityEnd ?? 0)}</td>
+                                <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.accent }}>+${Math.round(p.equityGain ?? 0)}</td>
+                                <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.sub }}>{p.barCount ?? "—"}</td>
+                                <td style={{ padding: "4px 6px", fontFamily: "monospace", color: C.sub, fontSize: 8 }}>{p.source ?? "—"}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                    {tuneActivityLog.length > 0 && (
+                      <div style={{ marginTop: 12, fontSize: 9, color: C.sub }}>
+                        Recent log: {tuneActivityLog.slice(0, 5).map(l => `${l.symbol} ${l.interval} $${Math.round(l.equityEnd)}`).join(" · ")}
+                      </div>
+                    )}
+                    <div style={{ marginTop: 8, fontSize: 9, color: C.sub }}>
+                      Click a row to load symbol, max date range, HTF, params and open Overview.
+                    </div>
+                  </div>
+                </Panel>
+              )}
+
               {/* ── OVERVIEW TAB ── */}
-              {activeTab === "overview" && (
+              {activeTab === "overview" && candleCount > 0 && result && (
                 <>
                   <Panel>
                     <PriceChart candles={candles} result={result} width={chartW - 32} height={320} symbol={symbol} viewRange={viewRange} />
@@ -2997,14 +3468,14 @@ export default function App() {
               )}
 
               {/* ── MONTHLY TAB ── */}
-              {activeTab === "monthly" && (
+              {activeTab === "monthly" && candleCount > 0 && result && (
                 <Panel title="Monthly Returns Breakdown">
                   <MonthlyTable monthlyRets={result.monthlyRets} />
                 </Panel>
               )}
 
               {/* ── OPTIMIZE TAB ── */}
-              {activeTab === "optimize" && (
+              {activeTab === "optimize" && candleCount > 0 && result && (
                 <>
                   <Panel>
                     <div style={{ padding: "12px 14px" }}>
@@ -3077,7 +3548,7 @@ export default function App() {
               )}
 
               {/* ── MONTE CARLO TAB ── */}
-              {activeTab === "montecarlo" && (
+              {activeTab === "montecarlo" && candleCount > 0 && result && (
                 <>
                   <Panel>
                     <div style={{ padding: "12px 14px" }}>
@@ -3104,7 +3575,7 @@ export default function App() {
               )}
 
               {/* ── WALK-FORWARD TAB ── */}
-              {activeTab === "walkforward" && (
+              {activeTab === "walkforward" && candleCount > 0 && result && (
                 <>
                   <Panel>
                     <div style={{ padding: "12px 14px" }}>
