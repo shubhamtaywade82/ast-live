@@ -804,7 +804,13 @@ function runSmartOptimization(candles, baseParams, ranges, onProgress, options =
       baseParams,
       ranges,
       p => runBacktest(candles, p, htfAlignedDir),
-      { onProgress, regimeModel, compact, bounds: buildTuneBounds(compact) },
+      {
+        onProgress,
+        regimeModel,
+        compact,
+        bounds: buildTuneBounds(compact),
+        attachMLFn: p => attachMLSignalFilter(candles, p, htfAlignedDir),
+      },
     );
     return { results: ml.results, mlMeta: ml };
   }
@@ -951,6 +957,8 @@ function tuneHistoryToOptResults(history) {
     equityEnd: t.bestEquityEnd ?? t.lastEquityEnd ?? t.equityEnd,
     equityGain: t.equityGain ?? ((t.bestEquityEnd ?? t.lastEquityEnd ?? t.equityEnd ?? 0) - (t.equityStart ?? 0)),
     source: t.source ?? t.sources?.[0] ?? "adaptive",
+    regime: t.regime,
+    regimeConfidence: t.regimeConfidence,
     method: t.method,
   })).sort((a, b) => (b.equityEnd ?? 0) - (a.equityEnd ?? 0));
 }
@@ -1145,20 +1153,22 @@ function assembleBacktestResult(candles, p, indicators, trades, equityCurve, dra
 }
 
 function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedDir = null, onProgress, options = {}) {
-  const { useML = true, regimeModel: initialRegimeModel = null } = options;
+  const { useML = true } = options;
   const { lookback, retuneEvery } = config;
   const n = candles.length;
   const startEquity = baseParams.startEquity || 10000;
   const compact = n > 2500;
-  const regimeModel = initialRegimeModel ?? buildRegimeModel(candles);
   let mlMeta = null;
+  let lastWindowRegime = null;
 
   if (n < lookback + 50) {
+    const causalModel = n >= 80 ? buildRegimeModel(candles) : null;
     const { results, mlMeta: meta } = runSmartOptimization(
       candles, baseParams, optRanges, onProgress,
-      { useML, regimeModel, compact, htfAlignedDir },
+      { useML, regimeModel: causalModel, compact, htfAlignedDir },
     );
     mlMeta = meta;
+    lastWindowRegime = meta?.regime ?? null;
     const best = results[0];
     const bestParams = best ? normalizeParams({ ...baseParams, ...best.params }) : baseParams;
     const filtered = best ? attachMLSignalFilter(candles, bestParams, htfAlignedDir) : bestParams;
@@ -1179,7 +1189,8 @@ function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedD
         segmentReturn,
         equityStart: startEquity,
         equityEnd: finalEquity,
-        regime: best.regime,
+        regime: best.regime ?? lastWindowRegime?.label,
+        regimeConfidence: best.regimeConfidence ?? lastWindowRegime?.confidence,
         method: useML ? "genetic" : "grid",
         confirmed: true,
         source: "adaptive",
@@ -1194,11 +1205,12 @@ function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedD
       adaptive: true,
       mlPowered: useML,
       mlMeta,
+      currentRegime: lastWindowRegime,
       tunedParams: profitableParamHistory.at(-1)?.params ?? best?.params ?? null,
       tuneLog,
       profitableParamHistory,
       adaptiveConfig: config,
-      regimeModel,
+      regimeModel: causalModel,
     };
   }
 
@@ -1208,7 +1220,7 @@ function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedD
   const mergedEr = new Array(n).fill(0);
   const mergedSmoothF = new Array(n).fill(NaN);
   const mergedAtr = new Array(n).fill(NaN);
-  const mergedCi = baseParams.useRegimeFilter ? new Array(n).fill(NaN) : null;
+  const mergedCi = new Array(n).fill(NaN);
   const allTrades = [];
   const allDrawdowns = [];
   const tuneLog = [];
@@ -1217,6 +1229,7 @@ function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedD
   let cursor = 0;
   let lastGoodParams = baseParams;
   let windowNum = 0;
+  let lastRegimeModel = null;
   const totalSteps = Math.max(1, Math.ceil((n - lookback) / retuneEvery) + 1);
   let step = 0;
 
@@ -1228,27 +1241,85 @@ function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedD
     const trainEnd = segStart === 0 ? segEnd : segStart;
     const trainStart = Math.max(0, trainEnd - lookback);
     const trainCandles = candles.slice(trainStart, trainEnd);
+    const trainHtf = htfAlignedDir?.slice(trainStart, trainEnd) ?? null;
+    const causalCandles = candles.slice(0, trainEnd);
+    const windowRegimeModel = causalCandles.length >= 80 ? buildRegimeModel(causalCandles) : null;
+    lastRegimeModel = windowRegimeModel;
     const equityBeforeSeg = equity;
 
-    let segParams = lastGoodParams;
+    let candidateParams = lastGoodParams;
     let best = null;
+    let windowRegime = null;
+
     if (trainCandles.length >= 50) {
+      let optCandles = trainCandles;
+      let optHtf = trainHtf;
+      let holdoutCandles = null;
+      let holdoutHtf = null;
+
+      if (segStart === 0 && trainCandles.length >= 100) {
+        const split = Math.floor(trainCandles.length * 0.7);
+        optCandles = trainCandles.slice(0, split);
+        holdoutCandles = trainCandles.slice(split);
+        optHtf = trainHtf?.slice(0, split) ?? null;
+        holdoutHtf = trainHtf?.slice(split) ?? null;
+      }
+
       const { results, mlMeta: meta } = runSmartOptimization(
-        trainCandles, baseParams, optRanges,
+        optCandles, baseParams, optRanges,
         p => { if (onProgress) onProgress(Math.round((step / totalSteps) * 50 + p * 0.5)); },
-        { useML, regimeModel, compact, htfAlignedDir: null },
+        {
+          useML,
+          regimeModel: windowRegimeModel,
+          compact,
+          htfAlignedDir: optHtf,
+        },
       );
       if (meta && !mlMeta) mlMeta = meta;
+      windowRegime = meta?.regime ?? null;
+      lastWindowRegime = windowRegime;
       best = results[0] ?? null;
-      if (best) segParams = attachMLSignalFilter(trainCandles, normalizeParams({ ...baseParams, ...best.params }), null);
+
+      if (best) {
+        const tuned = normalizeParams({ ...baseParams, ...best.params });
+        candidateParams = attachMLSignalFilter(optCandles, tuned, optHtf);
+
+        if (holdoutCandles?.length >= 30) {
+          const holdoutParams = attachMLSignalFilter(holdoutCandles, tuned, holdoutHtf);
+          const hv = runBacktest(holdoutCandles, holdoutParams, holdoutHtf);
+          if (!isProfitableBacktest(hv.stats, hv.equityCurve, startEquity)) {
+            best = null;
+            candidateParams = lastGoodParams;
+          }
+        }
+      }
     }
 
     const warmup = Math.max(0, segStart - lookback);
     const slice = candles.slice(warmup, segEnd);
     const evalStartIdx = segStart - warmup;
-    const htfSlice = htfAlignedDir ? htfAlignedDir.slice(warmup, segEnd) : null;
+    const htfSlice = htfAlignedDir?.slice(warmup, segEnd) ?? null;
 
-    const seg = runBacktest(slice, segParams, htfSlice, { initialEquity: equity, evalStartIdx });
+    const runSeg = params => runBacktest(slice, params, htfSlice, { initialEquity: equity, evalStartIdx });
+
+    let seg = runSeg(candidateParams);
+    let equityAfterSeg = seg.equityCurve[slice.length - 1] ?? equity;
+    let segmentReturn = equityBeforeSeg > 0
+      ? ((equityAfterSeg - equityBeforeSeg) / equityBeforeSeg) * 100
+      : 0;
+
+    const candidateAccepted = best
+      && candidateParams !== lastGoodParams
+      && segmentReturn > 0
+      && equityAfterSeg > equityBeforeSeg;
+
+    if (best && !candidateAccepted && candidateParams !== lastGoodParams) {
+      seg = runSeg(lastGoodParams);
+      equityAfterSeg = seg.equityCurve[slice.length - 1] ?? equity;
+      segmentReturn = equityBeforeSeg > 0
+        ? ((equityAfterSeg - equityBeforeSeg) / equityBeforeSeg) * 100
+        : 0;
+    }
 
     for (let i = segStart; i < segEnd; i++) {
       const j = i - warmup;
@@ -1258,7 +1329,7 @@ function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedD
       mergedEr[i] = seg.er[j];
       mergedSmoothF[i] = seg.smoothF[j];
       mergedAtr[i] = seg.atr[j];
-      if (mergedCi && seg.ci) mergedCi[i] = seg.ci[j];
+      if (seg.ci) mergedCi[i] = seg.ci[j];
     }
 
     for (const t of seg.trades) {
@@ -1266,14 +1337,9 @@ function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedD
     }
     allDrawdowns.push(...seg.drawdowns);
 
-    const equityAfterSeg = seg.equityCurve[slice.length - 1] ?? equity;
-    const segmentReturn = equityBeforeSeg > 0
-      ? ((equityAfterSeg - equityBeforeSeg) / equityBeforeSeg) * 100
-      : 0;
-
-    if (best && segmentReturn > 0 && equityAfterSeg > equityBeforeSeg) {
+    if (candidateAccepted) {
       windowNum++;
-      lastGoodParams = segParams;
+      lastGoodParams = candidateParams;
       const entry = buildTuneEntry({
         window: windowNum,
         bar: segStart,
@@ -1284,7 +1350,8 @@ function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedD
         segmentReturn,
         equityStart: equityBeforeSeg,
         equityEnd: equityAfterSeg,
-        regime: best.regime,
+        regime: best.regime ?? windowRegime?.label,
+        regimeConfidence: best.regimeConfidence ?? windowRegime?.confidence,
         method: useML ? "genetic" : "grid",
         confirmed: true,
         source: "adaptive",
@@ -1322,11 +1389,12 @@ function runAdaptiveBacktest(candles, baseParams, optRanges, config, htfAlignedD
     adaptive: true,
     mlPowered: useML,
     mlMeta,
+    currentRegime: lastWindowRegime,
     tunedParams: latestParams,
     tuneLog,
     profitableParamHistory,
     adaptiveConfig: config,
-    regimeModel,
+    regimeModel: lastRegimeModel,
   };
 }
 
@@ -2653,8 +2721,10 @@ export default function App() {
   const lastER = result?.er?.filter(v => !isNaN(v)).at(-1) ?? 0;
   const lastF = result?.smoothF?.filter(v => !isNaN(v)).at(-1) ?? 0;
   const lastCI = result?.ci?.filter(v => !isNaN(v)).at(-1) ?? 50;
-  const regime = lastER > 0.62 ? "Trending" : lastER > 0.38 ? "Mixed" : "Choppy";
-  const regimeColor = lastER > 0.62 ? C.accent : lastER > 0.38 ? C.yellow : C.red;
+  const mlRegime = result?.currentRegime ?? result?.mlMeta?.regime;
+  const regime = mlRegime?.label ?? (lastER > 0.62 ? "Trending" : lastER > 0.38 ? "Mixed" : "Choppy");
+  const regimeConfidence = mlRegime?.confidence;
+  const regimeColor = regime === "Trending" ? C.accent : regime === "Mixed" ? C.yellow : C.red;
 
   const candleCount = candles.length;
   const viewLen = viewRange[1] - viewRange[0];
@@ -2741,7 +2811,10 @@ export default function App() {
                 <StatRow label="Equity+ sets" value={profitableParams.length} color={C.accent} mono />
               )}
               {tuneLog?.length > 0 && (
-                <StatRow label="Tune windows" value={tuneLog.length} color={C.purple} mono />
+                <>
+                  <StatRow label="Tune windows" value={tuneLog.length} color={C.purple} mono />
+                  <StatRow label="Last window regime" value={tuneLog.at(-1)?.regime ?? "—"} color={regimeColor} />
+                </>
               )}
               {candleCount > 0 && !tuning && (
                 <button onClick={() => setRetuneToken(t => t + 1)} style={{ marginTop: 8, width: "100%", padding: "5px 8px", borderRadius: 6, border: `1px solid ${C.purple}66`, background: C.purple + "18", color: C.purple, fontSize: 10, cursor: "pointer" }}>
@@ -2804,7 +2877,7 @@ export default function App() {
             <StatRow label="ER" value={(lastER * 100).toFixed(1) + "%"} color={regimeColor} mono />
             <StatRow label="Factor" value={lastF.toFixed(2) + "x"} color={C.yellow} mono />
             <StatRow label="Choppiness" value={lastCI.toFixed(1)} color={lastCI > 61.8 ? C.red : lastCI > 50 ? C.yellow : C.accent} mono />
-            <StatRow label="Regime" value={regime} color={regimeColor} />
+            <StatRow label="Regime" value={regimeConfidence ? `${regime} (${(regimeConfidence * 100).toFixed(0)}%)` : regime} color={regimeColor} />
             {candleCount > 0 && <StatRow label="Bars" value={candleCount.toLocaleString()} color={C.sub} mono />}
           </div>
 
@@ -2881,7 +2954,7 @@ export default function App() {
                   <button onClick={() => { const n = candleCount, v = Math.min(n, 200); setViewRange([n - v, n]); }} style={navBtn}>Latest</button>
                 </div>
                 <div style={{ padding: "3px 8px", borderRadius: 4, fontSize: 9, fontWeight: 700, background: regimeColor + "20", color: regimeColor, border: `1px solid ${regimeColor}44` }}>
-                  {regime} ER={(lastER * 100).toFixed(0)}% CI={lastCI.toFixed(0)}
+                  {regime}{regimeConfidence ? ` ${(regimeConfidence * 100).toFixed(0)}%` : ""} ER={(lastER * 100).toFixed(0)}% CI={lastCI.toFixed(0)}
                 </div>
               </div>
 
@@ -2957,6 +3030,7 @@ export default function App() {
                               <thead>
                                 <tr style={{ borderBottom: `1px solid ${C.border}` }}>
                                   <th style={{ padding: "4px 6px", color: C.sub, textAlign: "left" }}>#</th>
+                                  <th style={{ padding: "4px 6px", color: C.sub, textAlign: "left" }}>Reg</th>
                                   <th style={{ padding: "4px 6px", color: C.sub, textAlign: "left" }}>Src</th>
                                   <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>ATR</th>
                                   <th style={{ padding: "4px 6px", color: C.sub, textAlign: "right" }}>ER</th>
@@ -2975,6 +3049,7 @@ export default function App() {
                                   <tr key={i} style={{ borderBottom: `1px solid ${C.border}11`, background: i === 0 ? C.accent + "11" : "transparent", cursor: "pointer" }}
                                     onClick={() => { setParams(p => normalizeParams({ ...p, ...r.params })); }}>
                                     <td style={{ padding: "4px 6px", color: C.sub, fontFamily: "monospace" }}>{i + 1}</td>
+                                    <td style={{ padding: "4px 6px", color: regimeColor, fontFamily: "monospace", fontSize: 8 }}>{r.regime ?? "—"}</td>
                                     <td style={{ padding: "4px 6px", color: C.label, fontFamily: "monospace", fontSize: 8 }}>{r.source ?? "—"}</td>
                                     <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.label }}>{fmtParamValue("atrPeriod", r.params.atrPeriod)}</td>
                                     <td style={{ padding: "4px 6px", textAlign: "right", fontFamily: "monospace", color: C.label }}>{fmtParamValue("erLength", r.params.erLength)}</td>

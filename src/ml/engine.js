@@ -128,13 +128,25 @@ export function kMeansRegime(featureHistory, k = 3, maxIter = 25) {
   const dims = vectors[0].length;
 
   let centroids = [];
-  const used = new Set();
-  while (centroids.length < k && centroids.length < vectors.length) {
-    const idx = Math.floor(Math.random() * vectors.length);
-    if (!used.has(idx)) {
+  if (vectors.length >= k) {
+    const erOrder = featureHistory
+      .map((f, i) => ({ i, er: f.er }))
+      .sort((a, b) => b.er - a.er);
+    const picks = [
+      erOrder[0]?.i ?? 0,
+      erOrder[Math.floor(erOrder.length / 2)]?.i ?? 0,
+      erOrder[erOrder.length - 1]?.i ?? 0,
+    ];
+    const used = new Set();
+    for (const idx of picks) {
+      if (used.has(idx)) continue;
       used.add(idx);
       centroids.push([...vectors[idx]]);
     }
+  }
+  while (centroids.length < k && centroids.length < vectors.length) {
+    const idx = centroids.length % vectors.length;
+    centroids.push([...vectors[idx]]);
   }
   if (!centroids.length) centroids = [vectors[0].slice()];
 
@@ -208,6 +220,40 @@ export function regimeParamBias(regimeLabel, baseParams) {
     b.smoothLength = clamp((b.smoothLength || 5) + 2, 1, 20);
   }
   return normalizeParams(b);
+}
+
+export function buildRegimeAwareBounds(baseBounds, regimeLabel) {
+  const b = { ...baseBounds };
+  if (regimeLabel === "Trending") {
+    b.minFactor = [0.5, 2.5];
+    b.maxFactor = [3, 9];
+    b.chopThreshold = [50, 65];
+    b.smoothLength = [1, 12];
+    b.useTrailingStop = "bool";
+  } else if (regimeLabel === "Choppy") {
+    b.minFactor = [1.0, 3.5];
+    b.maxFactor = [2, 5.5];
+    b.chopThreshold = [58, 80];
+    b.smoothLength = [3, 20];
+    b.riskPct = [0.005, 0.012];
+  } else {
+    b.minFactor = [0.8, 3.0];
+    b.maxFactor = [2.5, 7];
+    b.chopThreshold = [52, 72];
+  }
+  return b;
+}
+
+export function regimeAdjustedScore(baseScore, regime, stats) {
+  let score = baseScore * (regime?.confidence ?? 1);
+  if (regime?.label === "Choppy") {
+    score -= parseFloat(stats.maxDD) * 0.35;
+    if (stats.totalTrades > 40) score -= (stats.totalTrades - 40) * 0.15;
+  }
+  if (regime?.label === "Trending") {
+    score += Math.min(parseFloat(stats.profitFactor === "∞" ? 5 : stats.profitFactor), 5) * 1.5;
+  }
+  return score;
 }
 
 function randomInt(lo, hi) {
@@ -304,12 +350,17 @@ export function geneticOptimize(candles, baseParams, bounds, evaluate, config = 
     generations = 10,
     eliteCount = 4,
     seedParams = null,
+    regimeSeedRatio = 0.4,
     onProgress = null,
   } = config;
 
+  const regimeSeedCount = seedParams
+    ? Math.max(4, Math.floor(populationSize * regimeSeedRatio))
+    : 0;
+
   let population = [];
   for (let i = 0; i < populationSize; i++) {
-    population.push(randomIndividual(bounds, i < 8 ? seedParams : null));
+    population.push(randomIndividual(bounds, i < regimeSeedCount ? seedParams : null));
   }
 
   const allResults = [];
